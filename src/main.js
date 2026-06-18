@@ -1706,6 +1706,8 @@ async function init() {
     initMinimap();
     initSkidMarks();
     initVolumeSlider();
+    _positionStatsBelowInfo();
+    window.addEventListener( 'resize', _positionStatsBelowInfo );
 
     // First user gesture unlocks the AudioContext on every browser.
     const unlockAudio = () => { startAudio(); };
@@ -2744,7 +2746,9 @@ function pushAndDrawMultiGraph( id, values ) {
 
 function initStatsForNerds() {
 
-    // Toggle button — small pill below the three.js Stats overlay.
+    // Toggle button — small pill below the three.js Stats overlay. Top is
+    // set dynamically in _positionStatsBelowInfo() so it tracks #info's
+    // height as that panel grows (volume slider, minimap toggle, etc.).
     statsForNerds.toggleBtn = document.createElement( 'div' );
     statsForNerds.toggleBtn.style.cssText = [
         'position:absolute', 'top:240px', 'right:10px',
@@ -2760,13 +2764,14 @@ function initStatsForNerds() {
     statsForNerds.toggleBtn.addEventListener( 'click', toggleStatsForNerds );
     document.body.appendChild( statsForNerds.toggleBtn );
 
-    // Panel.
+    // Panel. Anchored top-and-bottom so it always leaves room for the
+    // speedometer / pos-pill at the bottom and content scrolls within.
     const panel = document.createElement( 'div' );
     panel.style.cssText = [
-        'position:absolute', 'top:240px', 'right:10px',
+        'position:absolute', 'top:240px', 'right:10px', 'bottom:110px',
         'padding:10px 12px 12px', 'background:rgba(0,0,0,0.72)', 'color:#fff',
         'font:11px Monospace', 'border-radius:6px', 'z-index:3',
-        'min-width:300px', 'max-width:340px', 'max-height:75vh', 'overflow-y:auto',
+        'min-width:300px', 'max-width:340px', 'overflow-y:auto',
         'display:none', 'border:1px solid rgba(255,255,255,0.18)',
         'box-shadow:0 6px 28px rgba(0,0,0,0.45)'
     ].join( ';' );
@@ -2843,6 +2848,18 @@ function initStatsForNerds() {
 
     document.body.appendChild( panel );
     statsForNerds.panel = panel;
+
+}
+
+function _positionStatsBelowInfo() {
+
+    const infoEl = document.getElementById( 'info' );
+    if ( ! infoEl || ! statsForNerds.toggleBtn ) return;
+    const top = Math.round( infoEl.getBoundingClientRect().bottom + 10 ) + 'px';
+    // setProperty with 'important' beats the mobile media query rule that
+    // pins the toggle to top:175px.
+    statsForNerds.toggleBtn.style.setProperty( 'top', top, 'important' );
+    if ( statsForNerds.panel ) statsForNerds.panel.style.setProperty( 'top', top, 'important' );
 
 }
 
@@ -3272,12 +3289,14 @@ function pollGamepad() {
     const lb = pad.buttons[ 4 ] && pad.buttons[ 4 ].pressed;
     const x = pad.buttons[ 2 ] && pad.buttons[ 2 ].pressed; // mode toggle
     const y = pad.buttons[ 3 ] && pad.buttons[ 3 ].pressed; // camera toggle
+    const back = pad.buttons[ 8 ] && pad.buttons[ 8 ].pressed; // Back / Select / Share — cycle car
     const start = pad.buttons[ 9 ] && pad.buttons[ 9 ].pressed; // reset
 
     if ( rb && ! prev[ 5 ] && transmission.mode === 'manual' ) manualShift( 1 );
     if ( lb && ! prev[ 4 ] && transmission.mode === 'manual' ) manualShift( - 1 );
     if ( x && ! prev[ 2 ] ) toggleTransmissionMode();
     if ( y && ! prev[ 3 ] ) cycleCameraMode();
+    if ( back && ! prev[ 8 ] ) cycleCar( 1 );
     if ( start && ! prev[ 9 ] ) input.keyR = true; else if ( ! start && prev[ 9 ] ) input.keyR = false;
 
     gamepad.prevButtons = pad.buttons.map( b => b.pressed );
