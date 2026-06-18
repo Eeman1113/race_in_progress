@@ -28,6 +28,124 @@ function iconHTML( name, size = 14 ) {
 
 }
 
+// ---------------- car swap (Q to cycle) ----------------
+
+function applyCarConfig( car, skipVisuals ) {
+
+    currentCar = car;
+
+    // Engine model values used by every per-frame path.
+    engine.idleRpm = car.engineIdleRpm;
+    engine.redline = car.engineRedline;
+    engine.autoUpshiftRpm = car.autoUpshiftRpm;
+    engine.autoDownshiftRpm = car.autoDownshiftRpm;
+
+    // Clamp current gear to the new car's gear count (if we shrank from 10
+    // gears down to 5 we don't want to be in nonexistent 8th).
+    if ( transmission.gear > car.gearRatios.length ) transmission.gear = car.gearRatios.length;
+
+    // Mass — Rapier setAdditionalMass adds to the baseline (lightest car).
+    if ( chassis ) {
+
+        const baselineMass = Math.min( ...CARS.map( c => c.mass ) );
+        const extra = Math.max( 0, car.mass - baselineMass );
+        chassis.setAdditionalMass( extra, true );
+
+    }
+
+    // Per-wheel suspension + friction + connection-point Y. Wheels keep their
+    // X/Z positions; we only retune what the wheel/spring does.
+    if ( vehicleController ) {
+
+        for ( let i = 0; i < 4; i ++ ) {
+
+            vehicleController.setWheelFrictionSlip( i, car.wheelFrictionSlip );
+            vehicleController.setWheelSuspensionStiffness( i, car.suspensionStiffness );
+            vehicleController.setWheelSuspensionCompression( i, car.suspensionCompression );
+            vehicleController.setWheelSuspensionRelaxation( i, car.suspensionRelaxation );
+            vehicleController.setWheelSuspensionRestLength( i, car.suspensionRestLength );
+            const cp = vehicleController.wheelChassisConnectionPointCs( i );
+            vehicleController.setWheelChassisConnectionPointCs( i, { x: cp.x, y: car.wheelConnectionY, z: cp.z } );
+
+        }
+
+    }
+
+    // Visuals.
+    if ( ! skipVisuals && carVisualsGroup ) {
+
+        _disposeCarVisuals();
+        buildCarVisuals( carVisualsGroup, car );
+
+    }
+
+    // Engine sound.
+    swapEngineAudio( car );
+
+    // Update the speedometer gear-digit colour + persistent top badge to match.
+    const hex = '#' + car.bodyColor.toString( 16 ).padStart( 6, '0' );
+    if ( speedoGearEl ) speedoGearEl.style.color = hex;
+    if ( carBadgeEl ) {
+
+        carBadgeEl.textContent = car.name.toUpperCase();
+        carBadgeEl.style.color = hex;
+        carBadgeEl.style.borderColor = hex + '4d'; // ~30% alpha
+
+    }
+
+}
+
+function cycleCar( direction ) {
+
+    currentCarIndex = ( currentCarIndex + direction + CARS.length ) % CARS.length;
+    applyCarConfig( CARS[ currentCarIndex ] );
+    showCarToast( CARS[ currentCarIndex ].name );
+
+}
+
+function initCarToast() {
+
+    // Persistent top-right badge: sits above the keybind cheatsheet. Rounded
+    // square edges (4px) to match the rest of the dark overlays.
+    carBadgeEl = document.createElement( 'div' );
+    carBadgeEl.style.cssText = [
+        'position:absolute', 'top:10px', 'right:10px',
+        'padding:6px 12px', 'background:rgba(0,0,0,0.55)',
+        'color:#FFCB47', 'font-family:Monospace', 'font-size:13px',
+        'font-weight:700', 'letter-spacing:2px', 'border-radius:4px',
+        'z-index:3', 'pointer-events:none',
+        'border:1px solid rgba(255,255,255,0.18)',
+        'box-shadow:0 4px 14px rgba(0,0,0,0.35)'
+    ].join( ';' );
+    carBadgeEl.textContent = currentCar.name.toUpperCase();
+    document.body.appendChild( carBadgeEl );
+
+    // Center pop-up toast on cycle.
+    carToastEl = document.createElement( 'div' );
+    carToastEl.style.cssText = [
+        'position:absolute', 'top:50%', 'left:50%', 'transform:translate(-50%,-50%)',
+        'padding:18px 36px', 'background:rgba(0,0,0,0.78)', 'color:#FFCB47',
+        'font-family:Monospace', 'font-size:28px', 'font-weight:700',
+        'letter-spacing:2px', 'border-radius:8px', 'z-index:10',
+        'pointer-events:none', 'opacity:0', 'transition:opacity 200ms',
+        'border:1px solid rgba(255,203,71,0.4)',
+        'box-shadow:0 8px 32px rgba(0,0,0,0.5)'
+    ].join( ';' );
+    document.body.appendChild( carToastEl );
+
+}
+
+let _carToastTimer = null;
+function showCarToast( name ) {
+
+    if ( ! carToastEl ) return;
+    carToastEl.textContent = '→  ' + name.toUpperCase();
+    carToastEl.style.opacity = '1';
+    if ( _carToastTimer ) clearTimeout( _carToastTimer );
+    _carToastTimer = setTimeout( () => { carToastEl.style.opacity = '0'; }, 1400 );
+
+}
+
 // ---------------- audio ----------------
 //
 // Two looping AudioBufferSourceNodes:
@@ -42,7 +160,8 @@ const audio = {
     engineNode: null,   squealNode: null,
     engineGain: null,   squealGain: null,
     masterGain: null,
-    smoothedSqueal: 0
+    smoothedSqueal: 0,
+    engineBufferCache: new Map() // url → AudioBuffer, lazily populated per car swap
 };
 
 const AUDIO_PATHS = {
@@ -55,6 +174,60 @@ async function _loadAudio( ctx, url ) {
     const res = await fetch( import.meta.env.BASE_URL + url );
     const buf = await res.arrayBuffer();
     return await ctx.decodeAudioData( buf );
+
+}
+
+// Helper used both at startup and when swapping cars: spin up a fresh
+// AudioBufferSourceNode wired to the persistent engineGain, with loopStart
+// set so the steady-state idle is what actually loops.
+function _startEngineNode( buffer, loopStart ) {
+
+    if ( ! audio.ctx || ! buffer ) return;
+    if ( audio.engineNode ) {
+
+        try { audio.engineNode.stop(); } catch ( e ) { /* already stopped */ }
+        audio.engineNode.disconnect();
+
+    }
+
+    const node = audio.ctx.createBufferSource();
+    node.buffer = buffer;
+    node.loop = true;
+    node.loopStart = loopStart;
+    node.loopEnd = buffer.duration;
+    node.connect( audio.engineGain );
+    node.start();
+    audio.engineNode = node;
+    audio.engineBuffer = buffer;
+
+}
+
+async function swapEngineAudio( car ) {
+
+    if ( ! audio.ctx || ! audio.started ) return;
+
+    let buf;
+    if ( audio.engineBufferCache.has( car.soundFile ) ) {
+
+        buf = audio.engineBufferCache.get( car.soundFile );
+
+    } else {
+
+        try {
+
+            buf = await _loadAudio( audio.ctx, car.soundFile );
+            audio.engineBufferCache.set( car.soundFile, buf );
+
+        } catch ( err ) {
+
+            // No file for this car yet — keep using the existing buffer but
+            // still re-apply the loopStart for this car's settings.
+            buf = audio.engineBuffer;
+
+        }
+
+    }
+    _startEngineNode( buf, car.soundLoopStart );
 
 }
 
@@ -75,29 +248,34 @@ async function startAudio() {
     try {
 
         [ audio.engineBuffer, audio.squealBuffer ] = await Promise.all( [
-            _loadAudio( ctx, AUDIO_PATHS.engine ),
+            _loadAudio( ctx, currentCar.soundFile ),
             _loadAudio( ctx, AUDIO_PATHS.squeal )
         ] );
+        audio.engineBufferCache.set( currentCar.soundFile, audio.engineBuffer );
 
     } catch ( err ) {
 
-        console.warn( '[audio] failed to load:', err );
-        return;
+        // Fall back to the generic engine.mp3 if the car-specific file is missing.
+        try {
+
+            audio.engineBuffer = await _loadAudio( ctx, AUDIO_PATHS.engine );
+            audio.squealBuffer = audio.squealBuffer || await _loadAudio( ctx, AUDIO_PATHS.squeal );
+            audio.engineBufferCache.set( AUDIO_PATHS.engine, audio.engineBuffer );
+
+        } catch ( err2 ) {
+
+            console.warn( '[audio] failed to load:', err2 );
+            return;
+
+        }
 
     }
 
-    audio.engineNode = ctx.createBufferSource();
-    audio.engineNode.buffer = audio.engineBuffer;
-    audio.engineNode.loop = true;
-    // First playback runs from the start of the file (the engine-startup
-    // transient sounds right). Once we hit the end and wrap, skip the first
-    // 3 seconds so the looped section is just the steady idle.
-    audio.engineNode.loopStart = 3.0;
-    audio.engineNode.loopEnd = audio.engineBuffer.duration;
     audio.engineGain = ctx.createGain();
     audio.engineGain.gain.value = 0.2;
-    audio.engineNode.connect( audio.engineGain ).connect( audio.masterGain );
-    audio.engineNode.start();
+    audio.engineGain.connect( audio.masterGain );
+
+    _startEngineNode( audio.engineBuffer, currentCar.soundLoopStart );
 
     audio.squealNode = ctx.createBufferSource();
     audio.squealNode.buffer = audio.squealBuffer;
@@ -151,10 +329,10 @@ function updateAudio( dt ) {
 
     if ( ! audio.started || ! audio.engineGain || ! vehicleController ) return;
 
-    // Engine pitch from RPM. Idle (~900) → 1.0, redline (~7500) → ~3.0.
-    // Map rpm linearly to playbackRate ∈ [0.55, 2.8] for an audible spread.
-    const rpmNorm = Math.max( 0, Math.min( 1, ( engine.rpm - 800 ) / ( engine.redline - 800 ) ) );
-    const targetRate = 0.55 + rpmNorm * 2.25;
+    // Engine pitch from RPM. Per-car pitchMin/pitchMax give each engine its
+    // own range — F1 ramps higher and steeper than the hatchback.
+    const rpmNorm = Math.max( 0, Math.min( 1, ( engine.rpm - engine.idleRpm ) / ( engine.redline - engine.idleRpm ) ) );
+    const targetRate = currentCar.pitchMin + rpmNorm * ( currentCar.pitchMax - currentCar.pitchMin );
     // Smooth pitch using setTargetAtTime so abrupt RPM jumps (gear changes)
     // don't click.
     audio.engineNode.playbackRate.setTargetAtTime( targetRate, audio.ctx.currentTime, 0.08 );
@@ -242,6 +420,8 @@ const transmission = {
 };
 
 // Engine model. RPM is computed from wheel speed × gear ratio × final drive.
+// idleRpm / redline / autoUpshiftRpm / autoDownshiftRpm are re-synced from the
+// current car each time the player swaps via Q.
 const engine = {
     rpm: 900,
     idleRpm: 900,
@@ -250,13 +430,143 @@ const engine = {
     autoDownshiftRpm: 2300
 };
 
-// Gear ratios indexed by gear number (key is gear number).
-// Reverse = -3.4, neutral = 0, 5 forward gears tuned for a hot hatch.
-const GEAR_RATIOS = { '-1': - 3.4, '0': 0, '1': 3.5, '2': 2.1, '3': 1.4, '4': 1.0, '5': 0.78 };
-const FINAL_DRIVE = 3.6;
+// Wheel radius is locked to the visual / collider geometry, so it stays fixed
+// across cars. Everything else (mass, gears, redline, friction, suspension,
+// brakes, engine sound, visual silhouette) is per-car in CARS below.
 const WHEEL_RADIUS = 0.3;
-const MAX_ENGINE_FORCE = 60; // peak force we'll apply to a single drive wheel
-const MAX_BRAKE_FORCE = 1.2;
+
+// Per-car configs tuned by the planning subagent against real-world archetypes.
+const CARS = [
+    // Hatchback — 1300 kg FWD economy car baseline.
+    {
+        name: 'Hatchback',
+        bodyColor: 0xFFCB47,
+        soundFile: 'sounds/engines/hatchback.mp3', soundLoopStart: 3.0,
+        pitchMin: 0.55, pitchMax: 2.8,
+        mass: 10, chassisFriction: 0.8,
+        maxEngineForce: 60, engineIdleRpm: 900, engineRedline: 7500,
+        peakTorqueRpm: 4500, torqueCurveWidth: 2400,
+        gearRatios: [ 3.5, 2.1, 1.4, 1.0, 0.78 ], reverseRatio: - 3.4, finalDrive: 3.6,
+        autoUpshiftRpm: 6200, autoDownshiftRpm: 2300,
+        wheelFrictionSlip: 2.0,
+        suspensionStiffness: 24, suspensionCompression: 2.0, suspensionRelaxation: 2.4,
+        suspensionRestLength: 0.4, wheelConnectionY: - 0.3,
+        maxBrakeForce: 1.2, handbrakeMultiplier: 1.6, maxSteeringAngle: Math.PI / 4
+    },
+    // Muscle V8 — 1700 kg Mustang GT class; heavy nose, fat low-end torque.
+    {
+        name: 'Muscle V8',
+        bodyColor: 0xB42020,
+        soundFile: 'sounds/engines/muscle.mp3', soundLoopStart: 3.0,
+        pitchMin: 0.6, pitchMax: 2.2,
+        mass: 13, chassisFriction: 0.8,
+        maxEngineForce: 110, engineIdleRpm: 750, engineRedline: 7000,
+        peakTorqueRpm: 3500, torqueCurveWidth: 2800,
+        gearRatios: [ 3.66, 2.43, 1.69, 1.32, 1.0, 0.79 ], reverseRatio: - 3.5, finalDrive: 3.55,
+        autoUpshiftRpm: 6000, autoDownshiftRpm: 2000,
+        wheelFrictionSlip: 1.8,
+        suspensionStiffness: 22, suspensionCompression: 1.9, suspensionRelaxation: 2.3,
+        suspensionRestLength: 0.42, wheelConnectionY: - 0.32,
+        maxBrakeForce: 1.4, handbrakeMultiplier: 1.7, maxSteeringAngle: Math.PI / 4.2
+    },
+    // Sport Flat-six — 1430 kg 911 GT3 class.
+    {
+        name: 'Sport Flat-six',
+        bodyColor: 0xC8CDD2,
+        soundFile: 'sounds/engines/sport.mp3', soundLoopStart: 3.0,
+        pitchMin: 0.7, pitchMax: 3.2,
+        mass: 11, chassisFriction: 0.85,
+        maxEngineForce: 140, engineIdleRpm: 1000, engineRedline: 9000,
+        peakTorqueRpm: 6500, torqueCurveWidth: 2000,
+        gearRatios: [ 3.91, 2.29, 1.65, 1.30, 1.08, 0.88 ], reverseRatio: - 3.55, finalDrive: 3.97,
+        autoUpshiftRpm: 8400, autoDownshiftRpm: 3200,
+        wheelFrictionSlip: 3.0,
+        suspensionStiffness: 34, suspensionCompression: 2.6, suspensionRelaxation: 2.9,
+        suspensionRestLength: 0.32, wheelConnectionY: - 0.28,
+        maxBrakeForce: 1.9, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4
+    },
+    // Rally Turbo — WRX STI class; AWD-feel grip, broad turbo plateau.
+    {
+        name: 'Rally Turbo',
+        bodyColor: 0x1F4DFF,
+        soundFile: 'sounds/engines/rally.mp3', soundLoopStart: 3.0,
+        pitchMin: 0.65, pitchMax: 2.9,
+        mass: 11, chassisFriction: 0.9,
+        maxEngineForce: 130, engineIdleRpm: 850, engineRedline: 8000,
+        peakTorqueRpm: 3000, torqueCurveWidth: 3200,
+        gearRatios: [ 3.64, 2.37, 1.76, 1.35, 1.06, 0.84 ], reverseRatio: - 3.55, finalDrive: 3.90,
+        autoUpshiftRpm: 6800, autoDownshiftRpm: 2600,
+        wheelFrictionSlip: 2.5,
+        suspensionStiffness: 26, suspensionCompression: 2.1, suspensionRelaxation: 2.5,
+        suspensionRestLength: 0.48, wheelConnectionY: - 0.34,
+        maxBrakeForce: 1.7, handbrakeMultiplier: 2.2, maxSteeringAngle: Math.PI / 3.8
+    },
+    // Supercar V12 — Ferrari 812 class.
+    {
+        name: 'Supercar V12',
+        bodyColor: 0xFF6F1A,
+        soundFile: 'sounds/engines/supercar.mp3', soundLoopStart: 3.0,
+        pitchMin: 0.7, pitchMax: 3.4,
+        mass: 12, chassisFriction: 0.85,
+        maxEngineForce: 160, engineIdleRpm: 1000, engineRedline: 8900,
+        peakTorqueRpm: 5500, torqueCurveWidth: 2600,
+        gearRatios: [ 3.08, 2.19, 1.63, 1.29, 1.03, 0.84, 0.69 ], reverseRatio: - 2.9, finalDrive: 4.10,
+        autoUpshiftRpm: 8300, autoDownshiftRpm: 3000,
+        wheelFrictionSlip: 2.8,
+        suspensionStiffness: 32, suspensionCompression: 2.5, suspensionRelaxation: 2.8,
+        suspensionRestLength: 0.30, wheelConnectionY: - 0.26,
+        maxBrakeForce: 2.0, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4
+    },
+    // F1 — 798 kg open-wheeler with V10-era 18000 rpm scream.
+    {
+        name: 'F1',
+        bodyColor: 0xD11A1A,
+        soundFile: 'sounds/engines/f1.mp3', soundLoopStart: 3.0,
+        pitchMin: 1.0, pitchMax: 4.0,
+        mass: 6, chassisFriction: 0.9,
+        maxEngineForce: 200, engineIdleRpm: 4000, engineRedline: 18000,
+        peakTorqueRpm: 13000, torqueCurveWidth: 3000,
+        gearRatios: [ 2.90, 2.20, 1.75, 1.42, 1.18, 1.0, 0.86, 0.74 ], reverseRatio: - 2.5, finalDrive: 4.4,
+        autoUpshiftRpm: 17500, autoDownshiftRpm: 6500,
+        wheelFrictionSlip: 4.0,
+        suspensionStiffness: 55, suspensionCompression: 3.4, suspensionRelaxation: 3.6,
+        suspensionRestLength: 0.18, wheelConnectionY: - 0.20,
+        maxBrakeForce: 3.0, handbrakeMultiplier: 1.5, maxSteeringAngle: Math.PI / 4.5
+    },
+    // God Car — physically impossible: max grip, 10 gears, flat torque, near-instant stops.
+    {
+        name: 'God Car',
+        bodyColor: 0xF0F0F8,
+        soundFile: 'sounds/engines/god.mp3', soundLoopStart: 3.0,
+        pitchMin: 0.4, pitchMax: 4.5,
+        mass: 5, chassisFriction: 1.0,
+        maxEngineForce: 260, engineIdleRpm: 1000, engineRedline: 20000,
+        peakTorqueRpm: 10000, torqueCurveWidth: 8000,
+        gearRatios: [ 3.2, 2.6, 2.1, 1.75, 1.45, 1.2, 1.0, 0.85, 0.72, 0.6 ], reverseRatio: - 3.0, finalDrive: 4.0,
+        autoUpshiftRpm: 19000, autoDownshiftRpm: 2500,
+        wheelFrictionSlip: 5.0,
+        suspensionStiffness: 45, suspensionCompression: 3.0, suspensionRelaxation: 3.2,
+        suspensionRestLength: 0.30, wheelConnectionY: - 0.26,
+        maxBrakeForce: 5.0, handbrakeMultiplier: 2.0, maxSteeringAngle: Math.PI / 4
+    }
+];
+
+let currentCarIndex = 0;
+let currentCar = CARS[ 0 ];
+let carVisualsGroup = null;
+let carToastEl = null;
+let carBadgeEl = null;
+
+const MINIMAP_LAYER = 2; // dedicated three.js layer for objects only the minimap should see
+const minimap = {
+    enabled: false,
+    containerEl: null,
+    canvas: null,
+    renderer: null,
+    camera: null,
+    toggleBtn: null,
+    marker: null
+};
 
 // Gamepad state — populated each frame in pollGamepad if one is plugged in.
 const gamepad = {
@@ -392,6 +702,7 @@ async function init() {
     initSpeedometer();
     initStatsForNerds();
     initTouchControls();
+    initCarToast();
 
     // First user gesture unlocks the AudioContext on every browser.
     const unlockAudio = () => { startAudio(); };
@@ -421,6 +732,7 @@ async function init() {
         if ( k === 'Control' && transmission.mode === 'manual' ) manualShift( - 1 );
 
         if ( k === 'm' || k === 'M' ) toggleTransmissionMode();
+        if ( k === 'q' || k === 'Q' ) cycleCar( 1 );
         if ( k === 'F3' ) { event.preventDefault(); toggleStatsForNerds(); }
 
         if ( k === 'c' || k === 'C' ) {
@@ -823,23 +1135,41 @@ function createCar() {
     mesh.position.copy( spawnPoint );
     mesh.quaternion.copy( spawnQuaternion );
 
-    physics.addMesh( mesh, 10, 0.8 );
+    // Mass baseline = the lightest car so we can only ADD mass dynamically
+    // (Rapier setAdditionalMass requires non-negative). All other cars layer
+    // additional mass on top in applyCarConfig.
+    const baselineMass = Math.min( ...CARS.map( c => c.mass ) );
+    physics.addMesh( mesh, baselineMass, currentCar.chassisFriction );
     chassis = mesh.userData.physics.body;
     chassis.setRotation( new physics.RAPIER.Quaternion( spawnQuaternion.x, spawnQuaternion.y, spawnQuaternion.z, spawnQuaternion.w ), true );
 
-    buildCarVisuals( mesh );
+    carVisualsGroup = new THREE.Group();
+    mesh.add( carVisualsGroup );
+    buildCarVisuals( carVisualsGroup, currentCar );
 
     vehicleController = physics.world.createVehicleController( chassis );
 
     wheels = [];
 
-    addWheel( 0, { x: - 1, y: - 0.3, z: - 1.5 }, mesh );
-    addWheel( 1, { x: 1, y: - 0.3, z: - 1.5 }, mesh );
-    addWheel( 2, { x: - 1, y: - 0.3, z: 1.5 }, mesh );
-    addWheel( 3, { x: 1, y: - 0.3, z: 1.5 }, mesh );
+    const wy = currentCar.wheelConnectionY;
+    addWheel( 0, { x: - 1, y: wy, z: - 1.5 }, mesh );
+    addWheel( 1, { x: 1, y: wy, z: - 1.5 }, mesh );
+    addWheel( 2, { x: - 1, y: wy, z: 1.5 }, mesh );
+    addWheel( 3, { x: 1, y: wy, z: 1.5 }, mesh );
 
-    vehicleController.setWheelSteering( 0, Math.PI / 4 );
-    vehicleController.setWheelSteering( 1, Math.PI / 4 );
+    vehicleController.setWheelSteering( 0, currentCar.maxSteeringAngle );
+    vehicleController.setWheelSteering( 1, currentCar.maxSteeringAngle );
+
+    // Sync runtime engine settings + per-wheel params for the starting car.
+    applyCarConfig( currentCar, /* skipVisuals */ true );
+
+    // Engine RPM defaults already match the hatchback; if a non-default car
+    // becomes the starter later this guarantees idle.
+    engine.idleRpm = currentCar.engineIdleRpm;
+    engine.redline = currentCar.engineRedline;
+    engine.autoUpshiftRpm = currentCar.autoUpshiftRpm;
+    engine.autoDownshiftRpm = currentCar.autoDownshiftRpm;
+    engine.rpm = engine.idleRpm;
 
 }
 
@@ -1261,7 +1591,7 @@ function initStatsForNerds() {
     // Toggle button — small pill below the three.js Stats overlay.
     statsForNerds.toggleBtn = document.createElement( 'div' );
     statsForNerds.toggleBtn.style.cssText = [
-        'position:absolute', 'top:200px', 'right:10px',
+        'position:absolute', 'top:240px', 'right:10px',
         'padding:5px 9px', 'background:rgba(0,0,0,0.55)', 'color:#fff',
         'font:11px Monospace', 'border-radius:4px', 'z-index:3',
         'cursor:pointer', 'user-select:none',
@@ -1277,7 +1607,7 @@ function initStatsForNerds() {
     // Panel.
     const panel = document.createElement( 'div' );
     panel.style.cssText = [
-        'position:absolute', 'top:200px', 'right:10px',
+        'position:absolute', 'top:240px', 'right:10px',
         'padding:10px 12px 12px', 'background:rgba(0,0,0,0.72)', 'color:#fff',
         'font:11px Monospace', 'border-radius:6px', 'z-index:3',
         'min-width:300px', 'max-width:340px', 'max-height:75vh', 'overflow-y:auto',
@@ -1433,40 +1763,198 @@ function updateStatsForNerds( speed ) {
 
 let _trackTris = 0;
 
-function buildCarVisuals( chassisMesh ) {
+// ── seven low-poly car silhouettes (from the design subagent) ─────────────
+const _visLightGeom = new THREE.BoxGeometry( 0.35, 0.18, 0.08 );
 
-    // Yellow body + dark cabin + tiny headlight/taillight boxes. Six draw calls
-    // total. Forward of the car is -Z (matches the front-wheel steering setup).
+function _addCarMesh( parent, geom, mat, pos, rot ) {
+
+    const m = new THREE.Mesh( geom, mat );
+    if ( pos ) m.position.set( pos[ 0 ], pos[ 1 ], pos[ 2 ] );
+    if ( rot ) m.rotation.set( rot[ 0 ] || 0, rot[ 1 ] || 0, rot[ 2 ] || 0 );
+    m.castShadow = true;
+    m.receiveShadow = true;
+    parent.add( m );
+    return m;
+
+}
+
+function _buildHatchback( parent ) {
+
     const bodyMat = new THREE.MeshStandardMaterial( { color: 0xFFCB47, roughness: 0.55, metalness: 0.15 } );
     const cabinMat = new THREE.MeshStandardMaterial( { color: 0x202830, roughness: 0.3, metalness: 0.4 } );
-    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.6, roughness: 0.3 } );
-    const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.7, roughness: 0.3 } );
-
-    // Body now extends almost all the way down to the chassis floor so the
-    // wheels poke up into the body sides (wheel-arch look) instead of dangling
-    // in mid-air below it.
-    const body = new THREE.Mesh( new THREE.BoxGeometry( 1.85, 0.7, 3.7 ), bodyMat );
-    body.position.y = - 0.15;
-    body.castShadow = true;
-    body.receiveShadow = true;
-    chassisMesh.add( body );
-
-    const cabin = new THREE.Mesh( new THREE.BoxGeometry( 1.55, 0.5, 1.9 ), cabinMat );
-    cabin.position.set( 0, 0.45, 0.05 );
-    cabin.castShadow = true;
-    chassisMesh.add( cabin );
-
-    const lightGeom = new THREE.BoxGeometry( 0.35, 0.18, 0.08 );
-
+    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.6 } );
+    const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.7 } );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.7, 3.7 ), bodyMat, [ 0, - 0.15, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.55, 0.5, 1.9 ), cabinMat, [ 0, 0.45, 0.05 ] );
     for ( const x of [ - 0.6, 0.6 ] ) {
 
-        const head = new THREE.Mesh( lightGeom, headlightMat );
-        head.position.set( x, - 0.08, - 1.86 );
-        chassisMesh.add( head );
+        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, - 0.08, - 1.86 ] );
+        _addCarMesh( parent, _visLightGeom, taillightMat, [ x, - 0.02, 1.86 ] );
 
-        const tail = new THREE.Mesh( lightGeom, taillightMat );
-        tail.position.set( x, - 0.02, 1.86 );
-        chassisMesh.add( tail );
+    }
+
+}
+
+function _buildMuscleV8( parent ) {
+
+    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xB42020, roughness: 0.45, metalness: 0.25 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x101418, roughness: 0.3, metalness: 0.5 } );
+    const stripeMat = new THREE.MeshStandardMaterial( { color: 0x0A0A0A, roughness: 0.6, metalness: 0.2 } );
+    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.7 } );
+    const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.8 } );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.8, 3.7 ), bodyMat, [ 0, - 0.1, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.45, 1.4 ), cabinMat, [ 0, 0.5, 0.55 ], [ - 0.08, 0, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.25, 0.95, 3.72 ), stripeMat, [ - 0.35, 0.32, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.25, 0.95, 3.72 ), stripeMat, [ 0.35, 0.32, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.3, 0.12, 0.5 ), bodyMat, [ - 0.3, 0.36, - 0.9 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.3, 0.12, 0.5 ), bodyMat, [ 0.3, 0.36, - 0.9 ] );
+    for ( const x of [ - 0.65, 0.65 ] ) {
+
+        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, 0, - 1.86 ] );
+        _addCarMesh( parent, _visLightGeom, taillightMat, [ x, 0.05, 1.86 ] );
+
+    }
+
+}
+
+function _buildSportFlatSix( parent ) {
+
+    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xC8CDD2, roughness: 0.4, metalness: 0.55 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x0A0C10, roughness: 0.2, metalness: 0.6 } );
+    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.7 } );
+    const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.8 } );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.5, 3.7 ), bodyMat, [ 0, - 0.25, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.45, 1.5 ), cabinMat, [ 0, 0.25, - 0.1 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.9, 0.25, 0.8 ), bodyMat, [ 0, 0.15, 1.2 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.08, 0.15 ), bodyMat, [ 0, 0.4, 1.7 ] );
+    for ( const x of [ - 0.6, 0.6 ] ) {
+
+        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, - 0.18, - 1.86 ] );
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.6, 0.1, 0.08 ), taillightMat, [ x, 0.05, 1.86 ] );
+
+    }
+
+}
+
+function _buildRallyTurbo( parent ) {
+
+    const bodyMat = new THREE.MeshStandardMaterial( { color: 0x1F4DFF, roughness: 0.5, metalness: 0.2 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x202830, roughness: 0.3, metalness: 0.4 } );
+    const goldMat = new THREE.MeshStandardMaterial( { color: 0xD4A52A, roughness: 0.4, metalness: 0.7 } );
+    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.7 } );
+    const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.8 } );
+    const roofLightMat = new THREE.MeshStandardMaterial( { color: 0xFFF4B0, emissive: 0xFFEE55, emissiveIntensity: 1.0 } );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.85, 3.7 ), bodyMat, [ 0, - 0.05, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.65, 0.6, 1.9 ), cabinMat, [ 0, 0.65, 0.05 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.5, 0.12, 0.45 ), bodyMat, [ 0, 1.0, 0.1 ] );
+    const roofLightGeom = new THREE.BoxGeometry( 0.22, 0.18, 0.18 );
+    for ( const x of [ - 0.6, - 0.2, 0.2, 0.6 ] ) _addCarMesh( parent, roofLightGeom, roofLightMat, [ x, 1.05, - 0.6 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.1, 0.35 ), goldMat, [ 0, 0.65, 1.75 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.25, 0.35 ), goldMat, [ - 0.55, 0.5, 1.75 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.25, 0.35 ), goldMat, [ 0.55, 0.5, 1.75 ] );
+    for ( const x of [ - 0.7, 0.7 ] ) {
+
+        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, 0.05, - 1.86 ] );
+        _addCarMesh( parent, _visLightGeom, taillightMat, [ x, 0.1, 1.86 ] );
+
+    }
+
+}
+
+function _buildSupercarV12( parent ) {
+
+    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xFF6F1A, roughness: 0.55, metalness: 0.3 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x0A0C10, roughness: 0.2, metalness: 0.6 } );
+    const darkMat = new THREE.MeshStandardMaterial( { color: 0x111111, roughness: 0.6, metalness: 0.3 } );
+    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.8 } );
+    const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.9 } );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.35, 3.7 ), bodyMat, [ 0, - 0.25, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.55, 0.5, 1.7 ), cabinMat, [ 0, 0.1, - 0.15 ], [ - 0.15, 0, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.8, 0.15, 0.7 ), bodyMat, [ 0, 0, 1.2 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.08, 0.3 ), darkMat, [ 0, - 0.5, - 1.75 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.6, 0.06, 0.2 ), darkMat, [ 0, 0.05, 1.85 ] );
+    for ( const x of [ - 0.55, 0.55 ] ) {
+
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.4, 0.1, 0.08 ), headlightMat, [ x, - 0.18, - 1.86 ] );
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.45, 0.1, 0.08 ), taillightMat, [ x, 0, 1.86 ] );
+
+    }
+
+}
+
+function _buildF1( parent ) {
+
+    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xD11A1A, roughness: 0.45, metalness: 0.35 } );
+    const darkMat = new THREE.MeshStandardMaterial( { color: 0x0A0A0A, roughness: 0.5, metalness: 0.4 } );
+    const cockpitMat = new THREE.MeshStandardMaterial( { color: 0x050505, roughness: 0.7, metalness: 0.2 } );
+    const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 1.0 } );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.7, 0.25, 3.7 ), bodyMat, [ 0, - 0.2, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.35, 0.18, 1.0 ), bodyMat, [ 0, - 0.2, - 1.85 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.05, 0.35 ), bodyMat, [ 0, - 0.35, - 2.0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 2.0, 0.08, 0.45 ), bodyMat, [ 0, 0.45, 1.85 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.55, 0.4 ), bodyMat, [ - 0.55, 0.2, 1.85 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.55, 0.4 ), bodyMat, [ 0.55, 0.2, 1.85 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.5, 0.35, 0.5 ), cockpitMat, [ 0, 0, 0.3 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.7, 0.08, 0.6 ), darkMat, [ 0, 0.4, 0.3 ], [ 0.3, 0, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.6, 0.18, 0.6 ), bodyMat, [ 0, - 0.15, 1.0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.18, 0.08 ), taillightMat, [ 0, 0.1, 1.86 ] );
+
+}
+
+function _buildGodCar( parent ) {
+
+    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xF0F0F8, roughness: 0.15, metalness: 0.85 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x0A0C10, roughness: 0.15, metalness: 0.7 } );
+    const darkMat = new THREE.MeshStandardMaterial( { color: 0x111111, roughness: 0.5, metalness: 0.4 } );
+    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFFFFF, emissive: 0xFFFFFF, emissiveIntensity: 1.5 } );
+    const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 1.0 } );
+    const roofLightMat = new THREE.MeshStandardMaterial( { color: 0xFFF4B0, emissive: 0xFFEE55, emissiveIntensity: 1.2 } );
+    const neonMat = new THREE.MeshStandardMaterial( { color: 0x00FFFF, emissive: 0x00FFFF, emissiveIntensity: 1.5 } );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.3, 3.7 ), bodyMat, [ 0, - 0.25, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.45, 1.7 ), cabinMat, [ 0, 0.15, - 0.1 ], [ - 0.15, 0, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.08, 0.3 ), darkMat, [ 0, - 0.5, - 1.75 ] );
+    const neon = new THREE.Mesh( new THREE.BoxGeometry( 1.7, 0.04, 3.4 ), neonMat );
+    neon.position.set( 0, - 0.46, 0 );
+    parent.add( neon );
+    _addCarMesh( parent, new THREE.BoxGeometry( 2.0, 0.08, 0.45 ), bodyMat, [ 0, 0.55, 1.8 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.4, 0.4 ), bodyMat, [ - 0.55, 0.35, 1.8 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.4, 0.4 ), bodyMat, [ 0.55, 0.35, 1.8 ] );
+    const roofLightGeom = new THREE.BoxGeometry( 0.2, 0.16, 0.16 );
+    for ( const x of [ - 0.5, - 0.17, 0.17, 0.5 ] ) _addCarMesh( parent, roofLightGeom, roofLightMat, [ x, 0.55, - 0.4 ] );
+    for ( const x of [ - 0.6, 0.6 ] ) {
+
+        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, - 0.2, - 1.86 ] );
+        _addCarMesh( parent, _visLightGeom, taillightMat, [ x, 0, 1.86 ] );
+
+    }
+
+}
+
+const _CAR_BUILDERS = {
+    'Hatchback': _buildHatchback,
+    'Muscle V8': _buildMuscleV8,
+    'Sport Flat-six': _buildSportFlatSix,
+    'Rally Turbo': _buildRallyTurbo,
+    'Supercar V12': _buildSupercarV12,
+    'F1': _buildF1,
+    'God Car': _buildGodCar
+};
+
+function buildCarVisuals( parent, car ) {
+
+    ( _CAR_BUILDERS[ car.name ] || _buildHatchback )( parent );
+
+}
+
+function _disposeCarVisuals() {
+
+    if ( ! carVisualsGroup ) return;
+    while ( carVisualsGroup.children.length > 0 ) {
+
+        const c = carVisualsGroup.children[ 0 ];
+        carVisualsGroup.remove( c );
+        if ( c.geometry ) c.geometry.dispose();
+        if ( c.material ) c.material.dispose();
 
     }
 
@@ -1474,12 +1962,7 @@ function buildCarVisuals( chassisMesh ) {
 
 function addWheel( index, pos, carMesh ) {
 
-    const wheelRadius = 0.3;
     const wheelWidth = 0.4;
-    // Was 0.8 — the long spring let wheels dangle visibly below the body. With
-    // 0.4 the wheels stay tucked up in the wheel wells. Stiffness unchanged so
-    // ride/handling feel is the same.
-    const suspensionRestLength = 0.4;
     const wheelDirection = { x: 0.0, y: - 1.0, z: 0.0 };
     const wheelAxle = { x: - 1.0, y: 0.0, z: 0.0 };
 
@@ -1487,20 +1970,17 @@ function addWheel( index, pos, carMesh ) {
         pos,
         wheelDirection,
         wheelAxle,
-        suspensionRestLength,
-        wheelRadius
+        currentCar.suspensionRestLength,
+        WHEEL_RADIUS
     );
 
-    vehicleController.setWheelSuspensionStiffness( index, 24.0 );
-    // Moderate damping — enough to kill the violent flicker on the trimesh
-    // track without flattening the suspension into a rigid stick. Spring bounce
-    // is preserved so the simulation still feels alive.
-    vehicleController.setWheelSuspensionCompression( index, 2.0 );
-    vehicleController.setWheelSuspensionRelaxation( index, 2.4 );
-    vehicleController.setWheelFrictionSlip( index, 2.0 );
+    vehicleController.setWheelSuspensionStiffness( index, currentCar.suspensionStiffness );
+    vehicleController.setWheelSuspensionCompression( index, currentCar.suspensionCompression );
+    vehicleController.setWheelSuspensionRelaxation( index, currentCar.suspensionRelaxation );
+    vehicleController.setWheelFrictionSlip( index, currentCar.wheelFrictionSlip );
     vehicleController.setWheelSteering( index, pos.z < 0 );
 
-    const geometry = new THREE.CylinderGeometry( wheelRadius, wheelRadius, wheelWidth, 16 );
+    const geometry = new THREE.CylinderGeometry( WHEEL_RADIUS, WHEEL_RADIUS, wheelWidth, 16 );
     geometry.rotateZ( Math.PI * 0.5 );
     const material = new THREE.MeshStandardMaterial( { color: 0x000000 } );
     const wheel = new THREE.Mesh( geometry, material );
@@ -1650,15 +2130,21 @@ function updateInput( dt ) {
 
 function gearRatio( gear ) {
 
-    return GEAR_RATIOS[ gear.toString() ] || 0;
+    if ( gear === 0 ) return 0;
+    if ( gear === - 1 ) return currentCar.reverseRatio;
+    const idx = gear - 1;
+    if ( idx < 0 || idx >= currentCar.gearRatios.length ) return 0;
+    return currentCar.gearRatios[ idx ];
 
 }
+
+function maxGear() { return currentCar.gearRatios.length; }
 
 function manualShift( direction ) {
 
     if ( transmission.shiftCooldown > 0 ) return;
     const next = transmission.gear + direction;
-    if ( next < - 1 || next > 5 ) return;
+    if ( next < - 1 || next > maxGear() ) return;
     transmission.gear = next;
     transmission.shiftCooldown = 0.15;
     playShiftSound();
@@ -1681,17 +2167,17 @@ function computeRpm( speed, gear ) {
     if ( ratio === 0 ) return engine.idleRpm;
     const wheelOmega = Math.abs( speed ) / WHEEL_RADIUS;       // rad/s
     const wheelRpm = wheelOmega * 60 / ( 2 * Math.PI );
-    const rpm = wheelRpm * Math.abs( ratio ) * FINAL_DRIVE;
+    const rpm = wheelRpm * Math.abs( ratio ) * currentCar.finalDrive;
     return Math.max( engine.idleRpm, rpm );
 
 }
 
-// Bell-shaped torque curve, normalized to [0,1]. Peak around 4500 RPM,
-// limits past redline.
+// Bell-shaped torque curve, normalized to [0,1]. Peak / width come from the
+// current car, so different engines have visibly different powerband shapes.
 function torqueAt( rpm ) {
 
     if ( rpm >= engine.redline ) return 0.15; // rev limiter cut
-    const x = ( rpm - 4500 ) / 2400;
+    const x = ( rpm - currentCar.peakTorqueRpm ) / currentCar.torqueCurveWidth;
     return Math.max( 0.18, Math.exp( - x * x ) );
 
 }
@@ -1733,7 +2219,7 @@ function updateTransmission( dt, speed ) {
     }
 
     // Upshift when RPM crosses threshold and we're under throttle.
-    if ( transmission.gear >= 1 && transmission.gear < 5 && engine.rpm > engine.autoUpshiftRpm && input.throttle > 0.4 ) {
+    if ( transmission.gear >= 1 && transmission.gear < maxGear() && engine.rpm > engine.autoUpshiftRpm && input.throttle > 0.4 ) {
 
         transmission.gear += 1;
         transmission.shiftCooldown = 0.25;
@@ -1791,7 +2277,7 @@ function applyVehicleForces( speed ) {
         // Force pushes the chassis in the -Z (forward) direction for + ratio,
         // and +Z for negative (reverse) ratio. Our convention from the original
         // example: negative wheel engine force => forward motion.
-        const magnitude = throttleEffective * torque * MAX_ENGINE_FORCE;
+        const magnitude = throttleEffective * torque * currentCar.maxEngineForce;
         engineForce = - magnitude * Math.sign( ratio );
 
     }
@@ -1807,10 +2293,10 @@ function applyVehicleForces( speed ) {
     if ( ! ( transmission.mode === 'auto' && input.reverseEngaged ) ) {
 
         // Light brake unless gear opposes motion → use engine braking instead.
-        serviceBrake = input.brake * MAX_BRAKE_FORCE;
+        serviceBrake = input.brake * currentCar.maxBrakeForce;
 
     }
-    const handbrake = input.handbrake * MAX_BRAKE_FORCE * 1.6;
+    const handbrake = input.handbrake * currentCar.maxBrakeForce * currentCar.handbrakeMultiplier;
 
     // Service brake on all 4, handbrake biased to rear wheels (indices 2,3).
     vehicleController.setWheelBrake( 0, serviceBrake );
@@ -1818,10 +2304,9 @@ function applyVehicleForces( speed ) {
     vehicleController.setWheelBrake( 2, Math.max( serviceBrake, handbrake ) );
     vehicleController.setWheelBrake( 3, Math.max( serviceBrake, handbrake ) );
 
-    // STEERING — smoothed.
+    // STEERING — smoothed. Max angle per car.
     const currentSteering = vehicleController.wheelSteering( 0 );
-    const steerAngle = Math.PI / 4;
-    const steering = THREE.MathUtils.lerp( currentSteering, steerAngle * input.steer, 0.25 );
+    const steering = THREE.MathUtils.lerp( currentSteering, currentCar.maxSteeringAngle * input.steer, 0.25 );
     vehicleController.setWheelSteering( 0, steering );
     vehicleController.setWheelSteering( 1, steering );
 
