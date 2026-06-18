@@ -146,6 +146,116 @@ function showCarToast( name ) {
 
 }
 
+// ---------------- minimap (bottom-left, top-down birds-eye) ----------------
+
+function initMinimap() {
+
+    // Bottom-left container: semi-transparent dark frame + rounded corners,
+    // matches the other overlay styling.
+    const wrap = document.createElement( 'div' );
+    wrap.style.cssText = [
+        'position:absolute', 'bottom:46px', 'left:10px',
+        'width:200px', 'height:200px',
+        'background:rgba(0,0,0,0.55)', 'border:1px solid rgba(255,255,255,0.22)',
+        'border-radius:8px', 'overflow:hidden', 'z-index:3',
+        'display:none', 'pointer-events:none',
+        'box-shadow:0 4px 16px rgba(0,0,0,0.4)'
+    ].join( ';' );
+    document.body.appendChild( wrap );
+    minimap.containerEl = wrap;
+
+    const canvas = document.createElement( 'canvas' );
+    canvas.width = Math.floor( 200 * window.devicePixelRatio );
+    canvas.height = Math.floor( 200 * window.devicePixelRatio );
+    canvas.style.cssText = 'width:200px;height:200px;display:block';
+    wrap.appendChild( canvas );
+    minimap.canvas = canvas;
+
+    // Tiny center-of-minimap dot for the car position (DOM, so it's crisp).
+    const dot = document.createElement( 'div' );
+    dot.style.cssText = [
+        'position:absolute', 'top:50%', 'left:50%', 'transform:translate(-50%,-50%)',
+        'width:0', 'height:0',
+        'border-left:6px solid transparent', 'border-right:6px solid transparent',
+        'border-bottom:10px solid #FFCB47', 'pointer-events:none'
+    ].join( ';' );
+    wrap.appendChild( dot );
+
+    // Dedicated WebGL renderer for the minimap canvas. Antialiasing off and
+    // shadow map disabled — minimap doesn't need them and we keep the cost low.
+    const r = new THREE.WebGLRenderer( { canvas, alpha: true, antialias: false } );
+    r.setPixelRatio( window.devicePixelRatio );
+    r.setSize( 200, 200, false );
+    r.setClearColor( 0x000000, 0 );
+    r.shadowMap.enabled = false;
+    minimap.renderer = r;
+
+    // Orthographic top-down camera. half-size 250 = shows a 500m × 500m area
+    // around the car. far 1000 covers the height drop on the Nürburgring.
+    const half = 250;
+    minimap.camera = new THREE.OrthographicCamera( - half, half, half, - half, 1, 1000 );
+    // Drive-up — camera.up is rotated each frame to the car's heading so the
+    // car always faces "up" on the map.
+    minimap.camera.up.set( 0, 0, - 1 );
+
+    // Toggle entry lives inside the keybind cheatsheet (#info) so it doesn't
+    // need its own button. Only this single <p> has pointer-events / cursor,
+    // the rest of the cheatsheet stays passive.
+    const infoEl = document.getElementById( 'info' );
+    if ( infoEl ) {
+
+        const line = document.createElement( 'p' );
+        line.textContent = 'minimap · off';
+        line.style.cssText = 'pointer-events:auto;cursor:pointer';
+        line.addEventListener( 'click', toggleMinimap );
+        line.addEventListener( 'mouseenter', () => { line.style.color = '#FFCB47'; } );
+        line.addEventListener( 'mouseleave', () => { line.style.color = ''; } );
+        infoEl.appendChild( line );
+        minimap.toggleBtn = line;
+
+    }
+
+}
+
+function toggleMinimap() {
+
+    minimap.enabled = ! minimap.enabled;
+    if ( minimap.containerEl ) minimap.containerEl.style.display = minimap.enabled ? 'block' : 'none';
+    if ( minimap.toggleBtn ) minimap.toggleBtn.textContent = 'minimap · ' + ( minimap.enabled ? 'on' : 'off' );
+
+}
+
+const _miniForward = new THREE.Vector3();
+const _miniQuat = new THREE.Quaternion();
+
+function renderMinimap() {
+
+    if ( ! minimap.enabled || ! car || ! chassis ) return;
+
+    // Camera position: high above the car so the ortho frustum covers a wide
+    // ground area without geometry clipping at the near plane.
+    minimap.camera.position.set( car.position.x, car.position.y + 500, car.position.z );
+
+    // Drive-up: rotate camera.up to the car's planar forward heading. Project
+    // to XZ plane so pitch/roll don't tilt the minimap.
+    const r = chassis.rotation();
+    _miniQuat.set( r.x, r.y, r.z, r.w );
+    _miniForward.set( 0, 0, - 1 ).applyQuaternion( _miniQuat );
+    _miniForward.y = 0;
+    if ( _miniForward.lengthSq() < 1e-4 ) _miniForward.set( 0, 0, - 1 );
+    _miniForward.normalize();
+    minimap.camera.up.copy( _miniForward );
+    minimap.camera.lookAt( car.position );
+
+    // Temporarily strip the HDR background so the minimap is transparent
+    // outside the track geometry — lets the dark panel behind show through.
+    const bg = scene.background;
+    scene.background = null;
+    minimap.renderer.render( scene, minimap.camera );
+    scene.background = bg;
+
+}
+
 // ---------------- audio ----------------
 //
 // Two looping AudioBufferSourceNodes:
@@ -703,6 +813,7 @@ async function init() {
     initStatsForNerds();
     initTouchControls();
     initCarToast();
+    initMinimap();
 
     // First user gesture unlocks the AudioContext on every browser.
     const unlockAudio = () => { startAudio(); };
@@ -2483,6 +2594,7 @@ function animate( time ) {
     if ( physicsHelper && physicsHelper.visible ) physicsHelper.update();
 
     renderer.render( scene, camera );
+    renderMinimap();
 
     stats.update();
 
