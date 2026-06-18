@@ -1609,8 +1609,35 @@ const gamepad = {
 };
 
 // Spawn pose captured live from driving the car onto the road and pressing P.
+// Mutated by swapMap() so the chassis-reset code path (input.reset) always
+// reads the active map's spawn.
 const spawnPoint = new THREE.Vector3( 3147.90, - 80.45, - 2733.54 );
 const spawnQuaternion = new THREE.Quaternion( - 0.0046, - 0.5791, 0.0216, 0.8150 );
+
+// Maps the player can hot-swap with the number keys 1 / 2. Each entry owns
+// its own glb path + spawn pose; swapMap(id) copies that pose into
+// spawnPoint / spawnQuaternion above and reloads the track.
+const MAPS = {
+    nurburgring: {
+        label: 'Nürburgring (Nordschleife)',
+        path: 'textures/models/nurburgring.glb',
+        spawnPos: { x: 3147.90, y: - 80.45, z: - 2733.54 },
+        spawnRot: { x: - 0.0046, y: - 0.5791, z: 0.0216, w: 0.8150 }
+    },
+    nurburgring_gp: {
+        label: 'Nürburgring GP (2022 layout)',
+        path: 'textures/models/nurburgring_gp.glb',
+        // 2× — compact GP layout, car feels appropriately sized against it.
+        scale: 2,
+        // Captured pose from the 5.5× session, rescaled by 2/5.5 so the
+        // car still lands on the same on-asphalt point at the new scale.
+        // Press P on-track if you want a tighter spawn.
+        spawnPos: { x: - 110.8, y: - 1.92, z: - 241.8 },
+        spawnRot: { x: - 0.0047, y: 0.2895, z: 0.0439, w: 0.9561 }
+    }
+};
+let currentMapId = 'nurburgring';
+let mapSwapInFlight = false;
 // Stored once so we can keep the directional light a fixed offset from the car.
 // Values match the original three.js example exactly: light sits 12.5 up and
 // 12.5 forward, giving a ~45° sun angle.
@@ -1775,6 +1802,8 @@ async function init() {
 
         if ( k === 'm' || k === 'M' ) toggleTransmissionMode();
         if ( k === 'q' || k === 'Q' ) cycleCar( 1 );
+        if ( k === '1' ) swapMap( 'nurburgring' );
+        if ( k === '2' ) swapMap( 'nurburgring_gp' );
         if ( k === 'F3' ) { event.preventDefault(); toggleStatsForNerds(); }
 
         if ( k === 'c' || k === 'C' ) cycleCameraMode();
@@ -2049,13 +2078,20 @@ function updateTrackShadowReceive() {
 
 async function loadTrack() {
 
-    if ( fpsLabel ) fpsLabel.textContent = 'loading track...';
+    const mapCfg = MAPS[ currentMapId ];
+    if ( fpsLabel ) fpsLabel.textContent = `loading ${ mapCfg.label }...`;
 
     const loader = new GLTFLoader();
     // Use BASE_URL so the path works both at /  (dev) and /race_in_progress/ (GH Pages).
-    const gltf = await loader.loadAsync( import.meta.env.BASE_URL + 'textures/models/nurburgring.glb' );
+    const gltf = await loader.loadAsync( import.meta.env.BASE_URL + mapCfg.path );
 
     track = gltf.scene;
+
+    // Optional per-map scale (e.g. the GP layout glb is authored ~1/30 size
+    // of the Nordschleife glb). Applied on the root so it flows through to
+    // both chunkTrackMeshes and the trimesh collider extraction — both bake
+    // matrixWorld into their output vertices.
+    if ( mapCfg.scale && mapCfg.scale !== 1 ) track.scale.setScalar( mapCfg.scale );
 
     // The GLB's root node already bakes in a Z-up→Y-up rotation matrix
     // (verified in the file's JSON chunk). Adding our own would double-rotate
@@ -2152,6 +2188,73 @@ async function loadTrack() {
 
     console.log( `[track] ${ totalTris.toLocaleString() } triangles, ${ chunkMeshes.length } chunks (${ ( tEnd - tStart ).toFixed( 0 ) } ms), spawn ${ spawnPoint.x.toFixed( 1 ) }, ${ spawnPoint.y.toFixed( 1 ) }, ${ spawnPoint.z.toFixed( 1 ) }` );
     if ( fpsLabel ) fpsLabel.textContent = `display ~${ fpsTarget.target }fps · ${ ( totalTris / 1000 ).toFixed( 0 ) }k tris · ${ chunkMeshes.length } chunks`;
+
+}
+
+// Hot-swap the active map. Tears down the current track mesh + static
+// physics body, loads the requested map, applies its spawn pose to the
+// shared spawnPoint/spawnQuaternion, then teleports the car onto it.
+async function swapMap( id ) {
+
+    if ( ! MAPS[ id ] || mapSwapInFlight || id === currentMapId ) return;
+    mapSwapInFlight = true;
+
+    // 1) Remove the existing visual track and free its geometry.
+    if ( track ) {
+
+        scene.remove( track );
+        track.traverse( ( obj ) => {
+
+            if ( obj.isMesh && obj.geometry ) obj.geometry.dispose();
+
+        } );
+        track = null;
+
+    }
+
+    // 2) Drop the static track rigid body (Rapier removes its colliders too).
+    if ( trackBody && physics && physics.world ) {
+
+        physics.world.removeRigidBody( trackBody );
+        trackBody = null;
+
+    }
+
+    // 3) Skid marks were stuck to the old surface — wipe them.
+    clearSkidMarks();
+
+    // 4) Switch the active map id and copy its spawn pose into the shared
+    //    spawnPoint / spawnQuaternion before loading, so the [track] log line
+    //    and any reset-during-load read the right values.
+    currentMapId = id;
+    const cfg = MAPS[ id ];
+    spawnPoint.set( cfg.spawnPos.x, cfg.spawnPos.y, cfg.spawnPos.z );
+    spawnQuaternion.set( cfg.spawnRot.x, cfg.spawnRot.y, cfg.spawnRot.z, cfg.spawnRot.w );
+
+    // 5) Load the new track geometry + collider mesh.
+    await loadTrack();
+
+    // 6) Teleport the car onto the new spawn — reuses the same reset path
+    //    the R key already uses, just inlined because we don't want to wait
+    //    for the next physics tick to read input.reset.
+    if ( chassis ) {
+
+        chassis.setTranslation( new physics.RAPIER.Vector3( spawnPoint.x, spawnPoint.y, spawnPoint.z ), true );
+        chassis.setRotation( new physics.RAPIER.Quaternion( spawnQuaternion.x, spawnQuaternion.y, spawnQuaternion.z, spawnQuaternion.w ), true );
+        chassis.setLinvel( new physics.RAPIER.Vector3( 0, 0, 0 ), true );
+        chassis.setAngvel( new physics.RAPIER.Vector3( 0, 0, 0 ), true );
+        transmission.gear = 1;
+        transmission.shiftCooldown = 0;
+        engine.rpm = engine.idleRpm;
+        input.reverseEngaged = false;
+        input.sHeldTime = 0;
+        chaseCam.initialized = false;
+        resetTires();
+        resetDrivetrain();
+
+    }
+
+    mapSwapInFlight = false;
 
 }
 
@@ -3336,6 +3439,7 @@ function pollGamepad() {
     const start = pad.buttons[ 9 ] && pad.buttons[ 9 ].pressed; // reset
     const dUp = pad.buttons[ 12 ] && pad.buttons[ 12 ].pressed; // D-pad up — stats for nerds
     const dLeft = pad.buttons[ 14 ] && pad.buttons[ 14 ].pressed; // D-pad left — minimap
+    const dRight = pad.buttons[ 15 ] && pad.buttons[ 15 ].pressed; // D-pad right — cycle map
 
     if ( rb && ! prev[ 5 ] && transmission.mode === 'manual' ) manualShift( 1 );
     if ( lb && ! prev[ 4 ] && transmission.mode === 'manual' ) manualShift( - 1 );
@@ -3344,6 +3448,7 @@ function pollGamepad() {
     if ( back && ! prev[ 8 ] ) cycleCar( 1 );
     if ( dUp && ! prev[ 12 ] ) toggleStatsForNerds();
     if ( dLeft && ! prev[ 14 ] ) toggleMinimap();
+    if ( dRight && ! prev[ 15 ] ) swapMap( currentMapId === 'nurburgring' ? 'nurburgring_gp' : 'nurburgring' );
     if ( start && ! prev[ 9 ] ) input.keyR = true; else if ( ! start && prev[ 9 ] ) input.keyR = false;
 
     // Any gamepad button press counts as a user gesture in modern browsers,
