@@ -28,6 +28,186 @@ function iconHTML( name, size = 14 ) {
 
 }
 
+// ---------------- steering wheel + cockpit (driver POV) ----------------
+
+function buildSteeringWheel( car ) {
+
+    const group = new THREE.Group();
+
+    let rimColor = 0x111111, hubColor = 0x222222, spokeColor = 0x111111;
+    let rimMetal = 0.4, rimRough = 0.6;
+    let hubMetal = 0.4, hubRough = 0.6;
+    let hubEmissive = 0x000000, hubEmissiveIntensity = 0;
+    let spokeMetal = 0.4, spokeRough = 0.6;
+    let flatBottom = false;
+    let paddles = false;
+
+    switch ( car.name ) {
+
+        case 'Hatchback':      rimColor = 0x111111; hubColor = 0xFFD400; spokeColor = 0xFFD400; break;
+        case 'Muscle V8':      rimColor = 0x111111; hubColor = 0xCC1A1A; spokeColor = 0x111111; break;
+        case 'Sport Flat-six': rimColor = 0x111111; hubColor = 0x1A1A1A; spokeColor = 0xC0C0C0; spokeMetal = 0.8; spokeRough = 0.3; break;
+        case 'Rally Turbo':    rimColor = 0x1F4DFF; hubColor = 0x111111; spokeColor = 0x111111; rimRough = 0.95; rimMetal = 0.05; break;
+        case 'Supercar V12':   rimColor = 0x0A0A0A; hubColor = 0x1A1A1A; spokeColor = 0xFF6F1A; rimRough = 0.9; rimMetal = 0.05; break;
+        case 'F1':             rimColor = 0x080808; hubColor = 0xCC1A1A; spokeColor = 0x111111; rimRough = 0.4; rimMetal = 0.3; flatBottom = true; paddles = true; break;
+        case 'God Car':        rimColor = 0xEEEEEE; hubColor = 0x00FFFF; spokeColor = 0xEEEEEE; rimMetal = 0.9; rimRough = 0.15; spokeMetal = 0.9; spokeRough = 0.15; hubEmissive = 0x00FFFF; hubEmissiveIntensity = 1.0; break;
+
+    }
+
+    const rimMat = new THREE.MeshStandardMaterial( { color: rimColor, metalness: rimMetal, roughness: rimRough } );
+    const hubMat = new THREE.MeshStandardMaterial( { color: hubColor, metalness: hubMetal, roughness: hubRough, emissive: hubEmissive, emissiveIntensity: hubEmissiveIntensity } );
+    const spokeMat = new THREE.MeshStandardMaterial( { color: spokeColor, metalness: spokeMetal, roughness: spokeRough } );
+
+    const rimR = 0.18, rimTube = 0.025;
+    let rimGeo;
+    if ( flatBottom ) {
+
+        const gap = Math.PI / 3;
+        rimGeo = new THREE.TorusGeometry( rimR, rimTube, 8, 32, Math.PI * 2 - gap );
+        rimGeo.rotateZ( - Math.PI / 2 + gap / 2 );
+
+    } else {
+
+        rimGeo = new THREE.TorusGeometry( rimR, rimTube, 8, 32 );
+
+    }
+    const rim = new THREE.Mesh( rimGeo, rimMat );
+    rim.castShadow = false;
+    group.add( rim );
+
+    const hub = new THREE.Mesh( new THREE.CylinderGeometry( 0.05, 0.05, 0.05, 16 ), hubMat );
+    hub.rotation.x = Math.PI / 2;
+    hub.castShadow = false;
+    group.add( hub );
+
+    const spokeInner = 0.04, spokeOuter = rimR;
+    const spokeLen = spokeOuter - spokeInner;
+    const spokeGeo = new THREE.BoxGeometry( spokeLen, 0.02, 0.015 );
+    const baseAngles = [ Math.PI / 2, Math.PI / 2 + ( 2 * Math.PI ) / 3, Math.PI / 2 + ( 4 * Math.PI ) / 3 ];
+    for ( const a of baseAngles ) {
+
+        const spoke = new THREE.Mesh( spokeGeo, spokeMat );
+        const midR = ( spokeInner + spokeOuter ) / 2;
+        spoke.position.set( Math.cos( a ) * midR, Math.sin( a ) * midR, 0 );
+        spoke.rotation.z = a;
+        spoke.castShadow = false;
+        group.add( spoke );
+
+    }
+
+    if ( paddles ) {
+
+        const paddleMat = new THREE.MeshStandardMaterial( { color: 0xCC1A1A, metalness: 0.3, roughness: 0.5 } );
+        const paddleGeo = new THREE.BoxGeometry( 0.06, 0.04, 0.01 );
+        const pL = new THREE.Mesh( paddleGeo, paddleMat );
+        pL.position.set( - 0.15, - 0.2, - 0.02 );
+        pL.castShadow = false;
+        group.add( pL );
+        const pR = new THREE.Mesh( paddleGeo, paddleMat );
+        pR.position.set( 0.15, - 0.2, - 0.02 );
+        pR.castShadow = false;
+        group.add( pR );
+
+    }
+
+    return group;
+
+}
+
+function _disposeSteeringWheel() {
+
+    if ( ! steeringWheelGroup || ! car ) return;
+    car.remove( steeringWheelGroup );
+    steeringWheelGroup.traverse( ( o ) => {
+
+        if ( o.geometry ) o.geometry.dispose();
+        if ( o.material ) o.material.dispose();
+
+    } );
+    steeringWheelGroup = null;
+    steeringWheelMesh = null;
+
+}
+
+function buildAndMountSteeringWheel( carConfig ) {
+
+    if ( ! car ) return;
+    _disposeSteeringWheel();
+    const cockpit = COCKPITS[ carConfig.name ];
+    if ( ! cockpit ) return;
+
+    steeringWheelGroup = new THREE.Group();
+    steeringWheelGroup.position.set( cockpit.steeringWheelOffset.x, cockpit.steeringWheelOffset.y, cockpit.steeringWheelOffset.z );
+    steeringWheelGroup.rotation.x = cockpit.steeringWheelTilt;
+    car.add( steeringWheelGroup );
+
+    steeringWheelMesh = buildSteeringWheel( carConfig );
+    steeringWheelGroup.add( steeringWheelMesh );
+
+}
+
+const _povWorldPos = new THREE.Vector3();
+const _povWorldLook = new THREE.Vector3();
+
+function updatePovCamera() {
+
+    if ( ! car ) return;
+    const cockpit = COCKPITS[ currentCar.name ];
+    if ( ! cockpit ) return;
+
+    _povWorldPos.set( cockpit.cockpitOffset.x, cockpit.cockpitOffset.y, cockpit.cockpitOffset.z );
+    car.localToWorld( _povWorldPos );
+    camera.position.copy( _povWorldPos );
+
+    _povWorldLook.set( cockpit.cockpitLookOffset.x, cockpit.cockpitLookOffset.y, cockpit.cockpitLookOffset.z );
+    car.localToWorld( _povWorldLook );
+    camera.lookAt( _povWorldLook );
+
+    if ( Math.abs( camera.fov - cockpit.fov ) > 0.1 ) {
+
+        camera.fov = cockpit.fov;
+        camera.updateProjectionMatrix();
+
+    }
+
+}
+
+function setCameraMode( mode ) {
+
+    cameraMode = mode;
+    if ( mode === 'pov' ) {
+
+        if ( carVisualsGroup ) carVisualsGroup.visible = false;
+        if ( controls ) controls.enabled = false;
+        chaseCam.enabled = false;
+
+    } else if ( mode === 'free' ) {
+
+        if ( carVisualsGroup ) carVisualsGroup.visible = true;
+        if ( controls ) controls.enabled = true;
+        chaseCam.enabled = false;
+        camera.fov = chaseCam.baseFov;
+        camera.updateProjectionMatrix();
+
+    } else { // chase
+
+        if ( carVisualsGroup ) carVisualsGroup.visible = true;
+        if ( controls ) controls.enabled = false;
+        chaseCam.enabled = true;
+        chaseCam.initialized = false;
+
+    }
+
+}
+
+function cycleCameraMode() {
+
+    const modes = [ 'chase', 'free', 'pov' ];
+    const next = ( modes.indexOf( cameraMode ) + 1 ) % modes.length;
+    setCameraMode( modes[ next ] );
+
+}
+
 // ---------------- car swap (Q to cycle) ----------------
 
 function applyCarConfig( car, skipVisuals ) {
@@ -78,6 +258,10 @@ function applyCarConfig( car, skipVisuals ) {
         buildCarVisuals( carVisualsGroup, car );
 
     }
+
+    // Cockpit / steering wheel rebuilt per-car (different colour, paddles
+    // for F1, flat-bottomed rim, etc.).
+    if ( ! skipVisuals ) buildAndMountSteeringWheel( car );
 
     // Engine sound.
     swapEngineAudio( car );
@@ -667,6 +851,28 @@ let carVisualsGroup = null;
 let carToastEl = null;
 let carBadgeEl = null;
 
+// Per-car cockpit / driver-POV configuration (from the planning subagent).
+// Each entry maps the car name to:
+//   cockpitOffset: chassis-local camera position (driver seat)
+//   cockpitLookOffset: chassis-local point the camera looks at
+//   steeringWheelOffset: chassis-local mount point of the wheel mesh
+//   steeringWheelTilt: x-rotation of the wheel parent group (radians)
+//   fov: degrees, used while POV is active (no speed-FOV boost in POV)
+//   wheelRotationMultiplier: visual wheel spin per radian of front-tyre steer
+const COCKPITS = {
+    'Hatchback':      { cockpitOffset:{x:-0.38,y:0.32,z:0.10}, cockpitLookOffset:{x:-0.38,y:0.30,z:-1.10}, steeringWheelOffset:{x:-0.38,y:0.10,z:-0.55}, steeringWheelTilt:0.35, fov:78, wheelRotationMultiplier:7.0 },
+    'Muscle V8':      { cockpitOffset:{x:-0.42,y:0.28,z:0.30}, cockpitLookOffset:{x:-0.42,y:0.26,z:-0.95}, steeringWheelOffset:{x:-0.42,y:0.05,z:-0.40}, steeringWheelTilt:0.30, fov:76, wheelRotationMultiplier:6.5 },
+    'Sport Flat-six': { cockpitOffset:{x:-0.40,y:0.18,z:0.20}, cockpitLookOffset:{x:-0.40,y:0.16,z:-1.05}, steeringWheelOffset:{x:-0.40,y:-0.02,z:-0.50}, steeringWheelTilt:0.38, fov:77, wheelRotationMultiplier:7.0 },
+    'Rally Turbo':    { cockpitOffset:{x:-0.40,y:0.42,z:0.15}, cockpitLookOffset:{x:-0.40,y:0.38,z:-1.20}, steeringWheelOffset:{x:-0.40,y:0.20,z:-0.55}, steeringWheelTilt:0.40, fov:80, wheelRotationMultiplier:7.5 },
+    'Supercar V12':   { cockpitOffset:{x:-0.36,y:0.10,z:0.05}, cockpitLookOffset:{x:-0.36,y:0.08,z:-1.30}, steeringWheelOffset:{x:-0.36,y:-0.10,z:-0.55}, steeringWheelTilt:0.45, fov:79, wheelRotationMultiplier:6.0 },
+    'F1':             { cockpitOffset:{x:0.00,y:0.08,z:0.40},  cockpitLookOffset:{x:0.00,y:0.05,z:-2.10},  steeringWheelOffset:{x:0.00,y:-0.05,z:-0.20}, steeringWheelTilt:1.22, fov:90, wheelRotationMultiplier:6.0 },
+    'God Car':        { cockpitOffset:{x:0.00,y:0.25,z:0.00},  cockpitLookOffset:{x:0.00,y:0.22,z:-1.80},  steeringWheelOffset:{x:0.00,y:0.05,z:-0.65}, steeringWheelTilt:0.52, fov:85, wheelRotationMultiplier:8.0 }
+};
+
+let cameraMode = 'chase'; // 'chase' | 'pov' | 'free'
+let steeringWheelGroup = null;   // tilted parent (chassis-local)
+let steeringWheelMesh = null;    // rotates each frame on Z
+
 const MINIMAP_LAYER = 2; // dedicated three.js layer for objects only the minimap should see
 const minimap = {
     enabled: false,
@@ -846,13 +1052,7 @@ async function init() {
         if ( k === 'q' || k === 'Q' ) cycleCar( 1 );
         if ( k === 'F3' ) { event.preventDefault(); toggleStatsForNerds(); }
 
-        if ( k === 'c' || k === 'C' ) {
-
-            chaseCam.enabled = ! chaseCam.enabled;
-            controls.enabled = ! chaseCam.enabled;
-            chaseCam.initialized = false;
-
-        }
+        if ( k === 'c' || k === 'C' ) cycleCameraMode();
 
         if ( k === 'h' || k === 'H' ) {
 
@@ -1271,6 +1471,8 @@ function createCar() {
     vehicleController.setWheelSteering( 0, currentCar.maxSteeringAngle );
     vehicleController.setWheelSteering( 1, currentCar.maxSteeringAngle );
 
+    buildAndMountSteeringWheel( currentCar );
+
     // Sync runtime engine settings + per-wheel params for the starting car.
     applyCarConfig( currentCar, /* skipVisuals */ true );
 
@@ -1569,13 +1771,7 @@ function initTouchControls() {
         () => { touch.handbrake = 1; },
         () => { touch.handbrake = 0; } );
     const shiftUp = _touchTapBtn( '↑', 22, () => { if ( transmission.mode === 'manual' ) manualShift( 1 ); } );
-    const cam = _touchTapBtn( 'CAM', 11, () => {
-
-        chaseCam.enabled = ! chaseCam.enabled;
-        if ( controls ) controls.enabled = ! chaseCam.enabled;
-        chaseCam.initialized = false;
-
-    } );
+    const cam = _touchTapBtn( 'CAM', 11, () => cycleCameraMode() );
     const shiftDn = _touchTapBtn( '↓', 22, () => { if ( transmission.mode === 'manual' ) manualShift( - 1 ); } );
     cluster.appendChild( hb );
     cluster.appendChild( shiftUp );
@@ -2163,13 +2359,7 @@ function pollGamepad() {
     if ( rb && ! prev[ 5 ] && transmission.mode === 'manual' ) manualShift( 1 );
     if ( lb && ! prev[ 4 ] && transmission.mode === 'manual' ) manualShift( - 1 );
     if ( x && ! prev[ 2 ] ) toggleTransmissionMode();
-    if ( y && ! prev[ 3 ] ) {
-
-        chaseCam.enabled = ! chaseCam.enabled;
-        if ( controls ) controls.enabled = ! chaseCam.enabled;
-        chaseCam.initialized = false;
-
-    }
+    if ( y && ! prev[ 3 ] ) cycleCameraMode();
     if ( start && ! prev[ 9 ] ) input.keyR = true; else if ( ! start && prev[ 9 ] ) input.keyR = false;
 
     gamepad.prevButtons = pad.buttons.map( b => b.pressed );
@@ -2562,14 +2752,31 @@ function animate( time ) {
 
     }
 
-    if ( chaseCam.enabled ) {
+    if ( cameraMode === 'chase' ) {
 
         updateChaseCamera( delta );
 
-    } else if ( controls && car ) {
+    } else if ( cameraMode === 'pov' ) {
+
+        updatePovCamera();
+
+    } else if ( controls && car ) { // free
 
         controls.target.copy( car.position );
         controls.update();
+
+    }
+
+    // Steering wheel mesh tracks the front tyre steer angle every frame,
+    // regardless of camera mode (so it animates the same in chase / free / pov).
+    if ( steeringWheelMesh && vehicleController ) {
+
+        const cockpit = COCKPITS[ currentCar.name ];
+        if ( cockpit ) {
+
+            steeringWheelMesh.rotation.z = - vehicleController.wheelSteering( 0 ) * cockpit.wheelRotationMultiplier;
+
+        }
 
     }
 
