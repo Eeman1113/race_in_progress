@@ -28,6 +28,23 @@ function iconHTML( name, size = 14 ) {
 
 }
 
+// On-screen touch controls. Activated when the device looks touch-only
+// (touchscreen present + no hover/fine pointer), or hidden when a gamepad
+// connects. Feeds touch.* into updateInput() in the standard merge path.
+const touch = {
+    enabled: false,
+    rootEl: null,
+    ringEl: null, thumbEl: null,
+    throttleFillEl: null, brakeFillEl: null,
+    steer: 0,
+    throttle: 0,
+    brake: 0,
+    handbrake: 0,
+    brakeActive: false,           // mirrors "S key held" for the long-press reverse logic
+    dragPointerId: - 1,
+    dragOriginX: 0
+};
+
 // Stats-for-nerds (F3-style) panel.
 const statsForNerds = {
     enabled: false,
@@ -212,6 +229,7 @@ async function init() {
 
     initSpeedometer();
     initStatsForNerds();
+    initTouchControls();
 
     window.addEventListener( 'keydown', ( event ) => {
 
@@ -296,6 +314,7 @@ async function init() {
         gamepad.index = e.gamepad.index;
         gamepad.id = e.gamepad.id;
         if ( speedoControllerEl ) speedoControllerEl.style.display = 'block';
+        if ( touch.enabled ) setTouchOverlayVisible( false ); // gamepad wins
         console.log( '[gamepad] connected:', e.gamepad.id );
 
     } );
@@ -307,6 +326,7 @@ async function init() {
             gamepad.index = - 1;
             gamepad.id = '';
             if ( speedoControllerEl ) speedoControllerEl.style.display = 'none';
+            if ( touch.enabled ) setTouchOverlayVisible( true );
 
         }
 
@@ -723,6 +743,260 @@ function updateSpeedometer( speed ) {
 
     const pct = Math.max( 0, Math.min( 100, ( engine.rpm / engine.redline ) * 100 ) );
     speedoRpmFillEl.style.width = pct.toFixed( 1 ) + '%';
+
+}
+
+// ---------------- touch controls ----------------
+
+function shouldShowTouch() {
+
+    const hasTouch = ( 'ontouchstart' in window ) || navigator.maxTouchPoints > 0;
+    const hasMouse = window.matchMedia && window.matchMedia( '(hover: hover) and (pointer: fine)' ).matches;
+    return hasTouch && ! hasMouse;
+
+}
+
+function _touchHoldBtn( label, fontSize, onDown, onUp ) {
+
+    const b = document.createElement( 'div' );
+    b.textContent = label;
+    b.style.cssText = [
+        'width:52px', 'height:52px', 'border-radius:10px',
+        'background:rgba(0,0,0,0.5)', 'color:#fff', 'font-family:Monospace',
+        'display:flex', 'align-items:center', 'justify-content:center',
+        `font-size:${ fontSize }px`, 'pointer-events:auto', 'user-select:none',
+        '-webkit-user-select:none', 'touch-action:none',
+        'border:1px solid rgba(255,255,255,0.18)', 'transition:transform 60ms,background 60ms'
+    ].join( ';' );
+    let pid = - 1;
+    b.addEventListener( 'pointerdown', ( e ) => {
+
+        if ( pid !== - 1 ) return;
+        pid = e.pointerId;
+        b.setPointerCapture( pid );
+        b.style.background = 'rgba(255,203,71,0.6)';
+        b.style.transform = 'scale(0.94)';
+        if ( onDown ) onDown();
+
+    } );
+    const release = ( e ) => {
+
+        if ( e.pointerId !== pid ) return;
+        pid = - 1;
+        b.style.background = 'rgba(0,0,0,0.5)';
+        b.style.transform = 'scale(1)';
+        if ( onUp ) onUp();
+
+    };
+    b.addEventListener( 'pointerup', release );
+    b.addEventListener( 'pointercancel', release );
+    b.addEventListener( 'pointerleave', release );
+    return b;
+
+}
+
+function _touchTapBtn( label, fontSize, onTap ) {
+
+    return _touchHoldBtn( label, fontSize, onTap, null );
+
+}
+
+function _touchPedal( color ) {
+
+    const bar = document.createElement( 'div' );
+    bar.style.cssText = [
+        'position:absolute', 'width:88px', 'height:240px',
+        'background:rgba(0,0,0,0.42)', 'border-radius:14px',
+        'border:1px solid rgba(255,255,255,0.15)',
+        'pointer-events:auto', 'touch-action:none', 'overflow:hidden'
+    ].join( ';' );
+    const fill = document.createElement( 'div' );
+    fill.style.cssText = [
+        'position:absolute', 'left:0', 'right:0', 'bottom:0',
+        `background:${ color }`, 'height:0%', 'transition:height 60ms linear', 'opacity:0.85'
+    ].join( ';' );
+    bar.appendChild( fill );
+    return { bar, fill };
+
+}
+
+function _bindPedal( bar, fill, kindKey ) {
+
+    let pid = - 1;
+    const setFromEvent = ( e ) => {
+
+        const rect = bar.getBoundingClientRect();
+        const y = e.clientY - rect.top;
+        const v = 1 - Math.max( 0, Math.min( 1, y / rect.height ) ); // top = max
+        touch[ kindKey ] = v;
+        fill.style.height = ( v * 100 ).toFixed( 1 ) + '%';
+        if ( kindKey === 'brake' ) touch.brakeActive = v > 0.05;
+
+    };
+    bar.addEventListener( 'pointerdown', ( e ) => {
+
+        if ( pid !== - 1 ) return;
+        pid = e.pointerId;
+        bar.setPointerCapture( pid );
+        setFromEvent( e );
+
+    } );
+    bar.addEventListener( 'pointermove', ( e ) => {
+
+        if ( e.pointerId !== pid ) return;
+        setFromEvent( e );
+
+    } );
+    const release = ( e ) => {
+
+        if ( e.pointerId !== pid ) return;
+        pid = - 1;
+        touch[ kindKey ] = 0;
+        if ( kindKey === 'brake' ) touch.brakeActive = false;
+        fill.style.height = '0%';
+
+    };
+    bar.addEventListener( 'pointerup', release );
+    bar.addEventListener( 'pointercancel', release );
+    bar.addEventListener( 'pointerleave', release );
+
+}
+
+function initTouchControls() {
+
+    if ( ! shouldShowTouch() ) return;
+    touch.enabled = true;
+
+    const root = document.createElement( 'div' );
+    root.id = 'touch-overlay';
+    root.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:5;user-select:none;-webkit-user-select:none';
+    document.body.appendChild( root );
+    touch.rootEl = root;
+
+    // ── floating drag-pad on the left half ──
+    const pad = document.createElement( 'div' );
+    pad.style.cssText = 'position:absolute;left:0;top:60px;bottom:120px;width:50%;pointer-events:auto;touch-action:none';
+    root.appendChild( pad );
+
+    const ring = document.createElement( 'div' );
+    ring.style.cssText = 'position:absolute;width:120px;height:120px;border-radius:50%;border:2px solid rgba(255,255,255,0.55);background:rgba(0,0,0,0.18);display:none;pointer-events:none;transform:translate(-50%,-50%)';
+    root.appendChild( ring );
+    touch.ringEl = ring;
+
+    const thumb = document.createElement( 'div' );
+    thumb.style.cssText = 'position:absolute;width:54px;height:54px;border-radius:50%;background:rgba(255,255,255,0.88);display:none;pointer-events:none;transform:translate(-50%,-50%);box-shadow:0 2px 10px rgba(0,0,0,0.4)';
+    root.appendChild( thumb );
+    touch.thumbEl = thumb;
+
+    pad.addEventListener( 'pointerdown', ( e ) => {
+
+        if ( touch.dragPointerId !== - 1 ) return;
+        touch.dragPointerId = e.pointerId;
+        pad.setPointerCapture( e.pointerId );
+        touch.dragOriginX = e.clientX;
+        ring.style.left = e.clientX + 'px';
+        ring.style.top = e.clientY + 'px';
+        ring.style.display = 'block';
+        thumb.style.left = e.clientX + 'px';
+        thumb.style.top = e.clientY + 'px';
+        thumb.style.display = 'block';
+        touch.steer = 0;
+
+    } );
+    pad.addEventListener( 'pointermove', ( e ) => {
+
+        if ( e.pointerId !== touch.dragPointerId ) return;
+        const dx = e.clientX - touch.dragOriginX;
+        const dead = 6;
+        const max = 90;
+        let v = 0;
+        if ( Math.abs( dx ) > dead ) {
+
+            const s = Math.sign( dx );
+            v = s * Math.min( 1, ( Math.abs( dx ) - dead ) / max );
+
+        }
+        // negate because in our control convention +1 = LEFT (matches keyA) and
+        // we want dragging right on screen to steer right (-1).
+        touch.steer = - v;
+        const clampedDx = Math.max( - max, Math.min( max, dx ) );
+        thumb.style.left = ( touch.dragOriginX + clampedDx ) + 'px';
+        thumb.style.top = e.clientY + 'px';
+
+    } );
+    const padRelease = ( e ) => {
+
+        if ( e.pointerId !== touch.dragPointerId ) return;
+        touch.dragPointerId = - 1;
+        touch.steer = 0;
+        ring.style.display = 'none';
+        thumb.style.display = 'none';
+
+    };
+    pad.addEventListener( 'pointerup', padRelease );
+    pad.addEventListener( 'pointercancel', padRelease );
+
+    // ── pedals (right side) ──
+    const throttle = _touchPedal( '#FFCB47' );
+    throttle.bar.style.right = '20px';
+    throttle.bar.style.bottom = '90px';
+    root.appendChild( throttle.bar );
+    _bindPedal( throttle.bar, throttle.fill, 'throttle' );
+    touch.throttleFillEl = throttle.fill;
+
+    const brake = _touchPedal( '#E04141' );
+    brake.bar.style.right = '116px';
+    brake.bar.style.bottom = '90px';
+    root.appendChild( brake.bar );
+    _bindPedal( brake.bar, brake.fill, 'brake' );
+    touch.brakeFillEl = brake.fill;
+
+    // ── 2×2 cluster above the pedals ──
+    const cluster = document.createElement( 'div' );
+    cluster.style.cssText = 'position:absolute;right:20px;bottom:340px;display:grid;grid-template-columns:52px 52px;gap:8px;pointer-events:none';
+    root.appendChild( cluster );
+
+    const hb = _touchHoldBtn( 'HB', 13,
+        () => { touch.handbrake = 1; },
+        () => { touch.handbrake = 0; } );
+    const shiftUp = _touchTapBtn( '↑', 22, () => { if ( transmission.mode === 'manual' ) manualShift( 1 ); } );
+    const cam = _touchTapBtn( 'CAM', 11, () => {
+
+        chaseCam.enabled = ! chaseCam.enabled;
+        if ( controls ) controls.enabled = ! chaseCam.enabled;
+        chaseCam.initialized = false;
+
+    } );
+    const shiftDn = _touchTapBtn( '↓', 22, () => { if ( transmission.mode === 'manual' ) manualShift( - 1 ); } );
+    cluster.appendChild( hb );
+    cluster.appendChild( shiftUp );
+    cluster.appendChild( cam );
+    cluster.appendChild( shiftDn );
+
+    // ── utility row top-center ──
+    const utility = document.createElement( 'div' );
+    utility.style.cssText = 'position:absolute;top:8px;left:50%;transform:translateX(-50%);display:flex;gap:8px;pointer-events:none';
+    root.appendChild( utility );
+
+    const resetBtn = _touchTapBtn( 'RESET', 10, () => {
+
+        input.keyR = true;
+        setTimeout( () => { input.keyR = false; }, 80 );
+
+    } );
+    resetBtn.style.width = '64px';
+    resetBtn.style.height = '36px';
+    const modeBtn = _touchTapBtn( 'A·M', 11, () => toggleTransmissionMode() );
+    modeBtn.style.width = '52px';
+    modeBtn.style.height = '36px';
+    utility.appendChild( resetBtn );
+    utility.appendChild( modeBtn );
+
+}
+
+function setTouchOverlayVisible( v ) {
+
+    if ( touch.rootEl ) touch.rootEl.style.display = v ? 'block' : 'none';
 
 }
 
@@ -1172,16 +1446,26 @@ function updateInput( dt ) {
 
     }
 
+    // Touch overlay merges in last. Analog values, max-wins.
+    if ( touch.enabled ) {
+
+        if ( Math.abs( touch.steer ) > Math.abs( steer ) ) steer = touch.steer;
+        if ( touch.throttle > throttle ) throttle = touch.throttle;
+        if ( touch.brake > brake ) brake = touch.brake;
+        if ( touch.handbrake > handbrake ) handbrake = touch.handbrake;
+
+    }
+
     input.steer = steer;
     input.throttle = throttle;
     input.brake = brake;
     input.handbrake = handbrake;
     input.reset = input.keyR;
 
-    // Long-press reverse: ONLY S / ↓ trigger this — Space is a pure brake.
-    // Also requires the car to be essentially stopped.
+    // Long-press reverse: S / ↓ / touch brake bar trigger this — Space is a
+    // pure brake and never engages reverse. Requires car essentially stopped.
     const speed = vehicleController ? Math.abs( vehicleController.currentVehicleSpeed() ) : 0;
-    const reverseTrigger = ( input.keyS || input.arrowDown ) ? 1 : 0;
+    const reverseTrigger = ( input.keyS || input.arrowDown || touch.brakeActive ) ? 1 : 0;
     if ( reverseTrigger > 0.5 && speed < 0.6 ) {
 
         input.sHeldTime += dt;
