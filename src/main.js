@@ -1148,21 +1148,40 @@ async function swapEngineAudio( car ) {
 
 function initVolumeSlider() {
 
-    const slider = document.getElementById( 'volumeSlider' );
-    const readout = document.getElementById( 'volumeValue' );
-    if ( ! slider ) return;
+    const infoEl = document.getElementById( 'info' );
+    if ( ! infoEl ) return;
 
     const saved = parseFloat( localStorage.getItem( 'masterVolume' ) );
     if ( Number.isFinite( saved ) && saved >= 0 && saved <= 1 ) audio.masterVolume = saved;
+
+    const row = document.createElement( 'div' );
+    row.className = 'volume-row';
+
+    const label = document.createElement( 'span' );
+    label.textContent = 'VOL';
+    label.style.opacity = '0.85';
+
+    const slider = document.createElement( 'input' );
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '1';
+    slider.step = '0.01';
     slider.value = String( audio.masterVolume );
-    if ( readout ) readout.textContent = Math.round( audio.masterVolume * 100 );
+
+    const readout = document.createElement( 'span' );
+    readout.textContent = Math.round( audio.masterVolume * 100 );
+
+    row.appendChild( label );
+    row.appendChild( slider );
+    row.appendChild( readout );
+    infoEl.insertBefore( row, infoEl.firstChild );
 
     slider.addEventListener( 'input', () => {
 
         const v = parseFloat( slider.value );
         audio.masterVolume = v;
         if ( audio.masterGain ) audio.masterGain.gain.value = v;
-        if ( readout ) readout.textContent = Math.round( v * 100 );
+        readout.textContent = Math.round( v * 100 );
         localStorage.setItem( 'masterVolume', String( v ) );
 
     } );

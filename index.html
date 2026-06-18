@@ -35,52 +35,42 @@
             }
             #info p { margin: 2px 0; }
 
-            #volume {
-                position: absolute;
-                top: 50px;
-                left: 10px;
-                padding: 6px 10px;
-                box-sizing: border-box;
-                color: #fff;
-                background: rgba(0,0,0,0.45);
-                border-radius: 4px;
-                font-size: 11px;
-                letter-spacing: 1.2px;
-                z-index: 1;
+            #info .volume-row {
                 display: flex;
                 align-items: center;
-                gap: 8px;
+                justify-content: flex-end;
+                gap: 6px;
+                margin: 2px 0 4px;
                 pointer-events: auto;
             }
-            #volume label { opacity: 0.85; }
-            #volume input[type=range] {
+            #info .volume-row input[type=range] {
                 -webkit-appearance: none;
                 appearance: none;
-                width: 110px;
+                width: 90px;
                 height: 4px;
                 background: rgba(255,255,255,0.25);
                 border-radius: 2px;
                 outline: none;
                 cursor: pointer;
             }
-            #volume input[type=range]::-webkit-slider-thumb {
+            #info .volume-row input[type=range]::-webkit-slider-thumb {
                 -webkit-appearance: none;
                 appearance: none;
-                width: 12px;
-                height: 12px;
+                width: 11px;
+                height: 11px;
                 border-radius: 50%;
                 background: #FFCB47;
                 cursor: pointer;
             }
-            #volume input[type=range]::-moz-range-thumb {
-                width: 12px;
-                height: 12px;
+            #info .volume-row input[type=range]::-moz-range-thumb {
+                width: 11px;
+                height: 11px;
                 border: none;
                 border-radius: 50%;
                 background: #FFCB47;
                 cursor: pointer;
             }
-            #volume span { min-width: 28px; text-align: right; opacity: 0.85; }
+            #info .volume-row span { min-width: 26px; text-align: right; opacity: 0.85; }
 
             /* ── Custom scrollbars on the overlay panels ──────────────────
                The stats-for-nerds panel scrolls; default OS scrollbars look
@@ -173,12 +163,6 @@
         </style>
     </head>
     <body>
-        <div id="volume">
-            <label for="volumeSlider">VOL</label>
-            <input id="volumeSlider" type="range" min="0" max="1" step="0.01" value="0.4">
-            <span id="volumeValue">40</span>
-        </div>
-
         <div id="info">
             <p>W / ↑ · throttle</p>
             <p>Space · brake</p>
