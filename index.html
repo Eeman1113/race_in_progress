@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <title>race_in_progress</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+        <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+        <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+        <style>
+            body {
+                color: #333;
+                margin: 0;
+                overflow: hidden;
+                font-family: Monospace;
+                background-color: #000;
+            }
+            #info {
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                padding: 6px 10px;
+                box-sizing: border-box;
+                text-align: right;
+                color: #fff;
+                background: rgba(0,0,0,0.45);
+                border-radius: 4px;
+                font-size: 12px;
+                z-index: 1;
+                pointer-events: none;
+            }
+            #info p { margin: 2px 0; }
+        </style>
+    </head>
+    <body>
+        <div id="info">
+            <p>W / ↑ · throttle</p>
+            <p>Space · brake</p>
+            <p>S / ↓ · brake · hold = reverse</p>
+            <p>A D / ← → · steer</p>
+            <p>E · handbrake</p>
+            <p>M · auto / manual</p>
+            <p>L⇧ · upshift  ·  L⌃ · downshift</p>
+            <p>R · reset</p>
+            <p>C · toggle chase / free cam</p>
+        </div>
+
+        <script type="module" src="/src/main.js"></script>
+    </body>
+</html>
