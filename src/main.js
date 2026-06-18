@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { RapierPhysics } from './lib/RapierPhysics.js';
 import { RapierHelper } from 'three/addons/helpers/RapierHelper.js';
 import Stats from 'three/addons/libs/stats.module.js';
@@ -89,7 +90,9 @@ const gamepad = {
 const spawnPoint = new THREE.Vector3( 3147.90, - 80.45, - 2733.54 );
 const spawnQuaternion = new THREE.Quaternion( - 0.0046, - 0.5791, 0.0216, 0.8150 );
 // Stored once so we can keep the directional light a fixed offset from the car.
-const sunOffset = new THREE.Vector3( 60, 120, 60 );
+// Values match the original three.js example exactly: light sits 12.5 up and
+// 12.5 forward, giving a ~45° sun angle.
+const sunOffset = new THREE.Vector3( 0, 12.5, 12.5 );
 
 // FPS lock state. `target` is decided after a brief refresh-rate detection
 // (see detectRefreshRate). We render at most once per `frameInterval` ms;
@@ -123,7 +126,22 @@ init();
 async function init() {
 
     scene = new THREE.Scene();
+    // Fallback flat colour while the HDR streams in (avoids a black flash).
     scene.background = new THREE.Color( 0xbfd1e5 );
+
+    // Equirectangular HDR — used as visible background only. We deliberately
+    // do NOT assign it to scene.environment because that floods every PBR
+    // material with indirect lighting and washes out the punchy direct-sun
+    // look the hemisphere + DirectionalLight pair was giving.
+    new RGBELoader().load( import.meta.env.BASE_URL + 'textures/sky.hdr', ( texture ) => {
+
+        texture.mapping = THREE.EquirectangularReflectionMapping;
+        scene.background = texture;
+        // HDR comes through brighter than SDR backgrounds — dial it down so the
+        // sky doesn't blow out the rest of the scene.
+        scene.backgroundIntensity = 0.45;
+
+    } );
 
     // Far plane bumped from 200 → 12000 because the track is ~6km across.
     camera = new THREE.PerspectiveCamera( chaseCam.baseFov, window.innerWidth / window.innerHeight, 0.1, 12000 );
@@ -132,25 +150,24 @@ async function init() {
     const ambient = new THREE.HemisphereLight( 0x555555, 0xFFFFFF );
     scene.add( ambient );
 
+    // Matches the original three.js example one-for-one, including radius/blurSamples
+    // (the user wanted the look back). The light + shadow frustum still follow the
+    // car every frame so shadows actually land somewhere on the 6km track.
     sunLight = new THREE.DirectionalLight( 0xffffff, 4 );
     sunLight.position.copy( sunOffset );
     sunLight.castShadow = true;
-    // Note: `shadow.radius` and `shadow.blurSamples` only apply to VSMShadowMap.
-    // Under the default PCFShadowMap they were dead code, so dropped.
+    sunLight.shadow.radius = 3;
+    sunLight.shadow.blurSamples = 8;
     sunLight.shadow.mapSize.width = 2048;
     sunLight.shadow.mapSize.height = 2048;
 
-    // Tight shadow frustum: ~120m wide around the car. We move the light + target
-    // with the car every frame so shadows stay sharp anywhere on the 6km track.
-    // Tight near/far bracket the actual caster (the car) for better depth precision.
-    const shadowSize = 60;
+    const shadowSize = 40;
     sunLight.shadow.camera.left = - shadowSize;
     sunLight.shadow.camera.bottom = - shadowSize;
     sunLight.shadow.camera.right = shadowSize;
     sunLight.shadow.camera.top = shadowSize;
-    sunLight.shadow.camera.near = 80;
-    sunLight.shadow.camera.far = 220;
-    sunLight.shadow.bias = - 0.0005;
+    sunLight.shadow.camera.near = 1;
+    sunLight.shadow.camera.far = 50;
     scene.add( sunLight );
 
     sunTarget = new THREE.Object3D();
@@ -476,7 +493,7 @@ function updateTrackShadowReceive() {
     const sx = sunTarget.position.x;
     const sy = sunTarget.position.y;
     const sz = sunTarget.position.z;
-    const margin = 75; // ±60m shadow extent + small slack
+    const margin = 55; // ±40m shadow extent + small slack
 
     for ( const child of track.children ) {
 
