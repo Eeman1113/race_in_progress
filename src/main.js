@@ -388,6 +388,17 @@ function updateSuspensionGeometry() {
 
 }
 
+// Wheel index convention is FL=0, FR=1, RL=2, RR=3 (matches the
+// "WHEELS · FL · FR · RL · RR" stats panel). Returns the indices that
+// receive engine torque for a given driveType.
+function drivenWheelIndices( driveType ) {
+
+    if ( driveType === 'RWD' ) return [ 2, 3 ];
+    if ( driveType === 'AWD' ) return [ 0, 1, 2, 3 ];
+    return [ 0, 1 ]; // FWD default
+
+}
+
 // ---------------- drivetrain v2 (engine flywheel + clutch + LSD) ----------------
 // Engine has its own angular velocity with flywheel inertia — no longer slaved
 // kinematically to wheel speed. Clutch couples engine and wheels through a stiff
@@ -790,6 +801,7 @@ function updateTires( dt ) {
     // forward).
     const vLong = - _carLocalVel.z;
     const vLat  = _carLocalVel.x;
+    const driven = drivenWheelIndices( currentCar.driveType );
 
     for ( let i = 0; i < 4; i ++ ) {
 
@@ -828,9 +840,10 @@ function updateTires( dt ) {
         // frame. Symptom: cruising cars showed slip ratio of -1 on all wheels.
         //
         // Instead derive vWheel kinematically from the drivetrain:
-        //   driven wheels (front, FWD): ω = engineOmega / gearMult
-        //   non-driven (rear)          : ω = vLong / WHEEL_RADIUS (free-rolling)
-        const isDriven = ( i === 0 || i === 1 );
+        //   driven wheel: ω = engineOmega / gearMult
+        //   non-driven  : ω = vLong / WHEEL_RADIUS (free-rolling)
+        // Driven set depends on the per-car driveType (FWD/RWD/AWD).
+        const isDriven = driven.indexOf( i ) >= 0;
         const ratio = gearRatio( transmission.gear );
         const engineOmegaRad = engine.rpm * Math.PI / 30; // RPM → rad/s
         let vWheel;
@@ -1411,7 +1424,8 @@ const CARS = [
         maxBrakeForce: 1.2, handbrakeMultiplier: 1.6, maxSteeringAngle: Math.PI / 4,
         camberDeg: [ - 0.5, - 0.5, - 0.3, - 0.3 ], toeDeg: [ 0, 0, 0.1, 0.1 ],
         engineInertia: 0.15, clutchStiffness: 280, lsdLocking: 0.30,
-        Cd: 0.0240, Cl: 0.0000
+        Cd: 0.0240, Cl: 0.0000,
+        driveType: 'FWD'
     },
     // Muscle V8 — 1700 kg Mustang GT class; heavy nose, fat low-end torque.
     {
@@ -1430,7 +1444,8 @@ const CARS = [
         maxBrakeForce: 1.4, handbrakeMultiplier: 1.7, maxSteeringAngle: Math.PI / 4.2,
         camberDeg: [ - 1, - 1, - 0.5, - 0.5 ], toeDeg: [ 0, 0, 0.1, 0.1 ],
         engineInertia: 0.18, clutchStiffness: 320, lsdLocking: 0.35,
-        Cd: 0.0207, Cl: 0.0000
+        Cd: 0.0207, Cl: 0.0000,
+        driveType: 'RWD'
     },
     // Sport Flat-six — 1430 kg 911 GT3 class.
     {
@@ -1449,7 +1464,8 @@ const CARS = [
         maxBrakeForce: 1.9, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4,
         camberDeg: [ - 2, - 2, - 1, - 1 ], toeDeg: [ - 0.1, - 0.1, 0.15, 0.15 ],
         engineInertia: 0.10, clutchStiffness: 500, lsdLocking: 0.65,
-        Cd: 0.0119, Cl: 0.0040
+        Cd: 0.0119, Cl: 0.0040,
+        driveType: 'RWD'
     },
     // Rally Turbo — WRX STI class; AWD-feel grip, broad turbo plateau.
     {
@@ -1468,7 +1484,8 @@ const CARS = [
         maxBrakeForce: 1.7, handbrakeMultiplier: 2.2, maxSteeringAngle: Math.PI / 3.8,
         camberDeg: [ - 1, - 1, - 0.8, - 0.8 ], toeDeg: [ 0, 0, 0, 0 ],
         engineInertia: 0.12, clutchStiffness: 450, lsdLocking: 0.80,
-        Cd: 0.0298, Cl: 0.0030
+        Cd: 0.0298, Cl: 0.0030,
+        driveType: 'AWD'
     },
     // Supercar V12 — Ferrari 812 class.
     {
@@ -1487,7 +1504,8 @@ const CARS = [
         maxBrakeForce: 2.0, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4,
         camberDeg: [ - 1.5, - 1.5, - 0.8, - 0.8 ], toeDeg: [ - 0.15, - 0.15, 0.2, 0.2 ],
         engineInertia: 0.09, clutchStiffness: 600, lsdLocking: 0.75,
-        Cd: 0.0177, Cl: 0.0090
+        Cd: 0.0177, Cl: 0.0090,
+        driveType: 'RWD'
     },
     // F1 — 798 kg open-wheeler with V10-era 18000 rpm scream.
     {
@@ -1506,7 +1524,8 @@ const CARS = [
         maxBrakeForce: 3.0, handbrakeMultiplier: 1.5, maxSteeringAngle: Math.PI / 4.5,
         camberDeg: [ - 3.5, - 3.5, - 1.8, - 1.8 ], toeDeg: [ - 0.3, - 0.3, 0.3, 0.3 ],
         engineInertia: 0.05, clutchStiffness: 800, lsdLocking: 1.00,
-        Cd: 0.0207, Cl: 0.0450
+        Cd: 0.0207, Cl: 0.0450,
+        driveType: 'RWD'
     },
     // God Car — physically impossible: max grip, 10 gears, flat torque, near-instant stops.
     {
@@ -1525,7 +1544,8 @@ const CARS = [
         maxBrakeForce: 5.0, handbrakeMultiplier: 2.0, maxSteeringAngle: Math.PI / 4,
         camberDeg: [ - 2, - 2, - 1, - 1 ], toeDeg: [ 0, 0, 0, 0 ],
         engineInertia: 0.04, clutchStiffness: 1200, lsdLocking: 1.00,
-        Cd: 0.0144, Cl: 0.0600
+        Cd: 0.0144, Cl: 0.0600,
+        driveType: 'AWD'
     }
 ];
 
@@ -2800,12 +2820,13 @@ function initStatsForNerds() {
 
     const drv = _sSection( panel, 'DRIVETRAIN' );
     _sStat( drv, 'mode', 's_mode' );
+    _sStat( drv, 'layout', 's_layout', 'drivetrain layout: FWD / RWD / AWD' );
     _sStat( drv, 'gear', 's_gear' );
     _sStat( drv, 'engine RPM', 's_rpm' );
     _sStat( drv, 'norm. torque', 's_torque', 'torque curve value at current RPM' );
-    _sStat( drv, 'wheel engine F', 's_engineF', 'force applied to front wheels' );
+    _sStat( drv, 'wheel engine F', 's_engineF', 'total engine force summed across all driven wheels' );
     _sStat( drv, 'clutch', 's_clutch', 'open during shifts / neutral, otherwise closed with slip torque' );
-    _sStat( drv, 'LSD bias', 's_lsdbias', 'torque split FL : FR (locked diff = always 50:50)' );
+    _sStat( drv, 'axle bias', 's_lsdbias', 'engine force split front : rear (FWD=100:0, RWD=0:100, AWD≈50:50)' );
     _sStat( drv, 'speed', 's_speed' );
 
     _sGraph( panel, 'RPM', 'g_rpm', 280, 36, '#F5D04A', 0, 7500 );
@@ -2907,19 +2928,24 @@ function updateStatsForNerds( speed ) {
     _sset( 's_reverse', input.reverseEngaged ? 'YES' : 'no' );
 
     _sset( 's_mode', transmission.mode.toUpperCase() );
+    _sset( 's_layout', currentCar.driveType || 'FWD' );
     const g = transmission.gear;
     _sset( 's_gear', g === - 1 ? 'R' : g === 0 ? 'N' : g.toString() );
     _sset( 's_rpm', engine.rpm.toFixed( 0 ) );
     _sset( 's_torque', torqueAt( engine.rpm ).toFixed( 3 ) );
-    _sset( 's_engineF', vehicleController.wheelEngineForce( 0 ).toFixed( 1 ) + ' N' );
+    // Total chassis engine force = sum across all wheels (zero on non-driven).
+    let eTotal = 0;
+    for ( let i = 0; i < 4; i ++ ) eTotal += Math.abs( vehicleController.wheelEngineForce( i ) );
+    _sset( 's_engineF', eTotal.toFixed( 1 ) + ' N' );
     _sset( 's_speed', `${ ( Math.abs( speed ) * 3.6 ).toFixed( 1 ) } km/h · ${ Math.abs( speed ).toFixed( 2 ) } m/s` );
 
-    // Clutch state + LSD bias.
+    // Clutch state + per-axle bias (display only — we use an even AWD split,
+    // so AWD will show roughly 50:50 front:rear; FWD = 100:0, RWD = 0:100).
     _sset( 's_clutch', drivetrain.clutchOpen ? 'OPEN' : `slip ${ drivetrain.clutchTorque.toFixed( 1 ) }` );
-    const eFL = Math.abs( vehicleController.wheelEngineForce( 0 ) );
-    const eFR = Math.abs( vehicleController.wheelEngineForce( 1 ) );
-    const eTot = Math.max( 0.01, eFL + eFR );
-    _sset( 's_lsdbias', `${ ( eFL / eTot * 100 ).toFixed( 0 ) } : ${ ( eFR / eTot * 100 ).toFixed( 0 ) }` );
+    const eFront = Math.abs( vehicleController.wheelEngineForce( 0 ) ) + Math.abs( vehicleController.wheelEngineForce( 1 ) );
+    const eRear  = Math.abs( vehicleController.wheelEngineForce( 2 ) ) + Math.abs( vehicleController.wheelEngineForce( 3 ) );
+    const eAxle = Math.max( 0.01, eFront + eRear );
+    _sset( 's_lsdbias', `F ${ ( eFront / eAxle * 100 ).toFixed( 0 ) } : R ${ ( eRear / eAxle * 100 ).toFixed( 0 ) }` );
 
     // Wheels — FL=0, FR=1, RL=2, RR=3 in our addWheel order.
     const wContact = [], wSusp = [], wSuspF = [], wFwdI = [], wSideI = [], wBrake = [];
@@ -3529,9 +3555,19 @@ function applyVehicleForces( speed, dt ) {
         engineForce = - magnitude * Math.sign( ratio );
 
     }
-    // Split evenly across the two drive wheels (FWD).
-    vehicleController.setWheelEngineForce( 0, engineForce );
-    vehicleController.setWheelEngineForce( 1, engineForce );
+    // Route engine force to the correct wheels for FWD/RWD/AWD. The original
+    // tuning was 2 wheels × engineForce → 2·engineForce total chassis force.
+    // Distribute the *same total* across however many driven wheels this car
+    // has, so swapping driveType doesn't change acceleration: each driven
+    // wheel gets (2·engineForce) / N. AWD therefore puts 50 % torque on each
+    // wheel (even split, simple center "diff").
+    const driven = drivenWheelIndices( currentCar.driveType );
+    const perDriven = ( 2 * engineForce ) / driven.length;
+    for ( let i = 0; i < 4; i ++ ) {
+
+        vehicleController.setWheelEngineForce( i, driven.indexOf( i ) >= 0 ? perDriven : 0 );
+
+    }
 
     // Light cosmetic clutch state for the stats display.
     drivetrain.clutchOpen = transmission.shiftCooldown > 0 || ratio === 0;
