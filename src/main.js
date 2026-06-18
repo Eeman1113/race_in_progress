@@ -28,6 +28,168 @@ function iconHTML( name, size = 14 ) {
 
 }
 
+// ---------------- audio ----------------
+//
+// Two looping AudioBufferSourceNodes:
+//  - engine: playbackRate (pitch) is driven by engine.rpm; volume by throttle.
+//  - squeal: volume is driven by max |wheelSideImpulse| across the four wheels.
+// AudioContext starts in 'suspended' state on most browsers — created lazily
+// on the first user gesture (keydown / pointerdown / touch).
+const audio = {
+    ctx: null,
+    started: false,
+    engineBuffer: null, squealBuffer: null,
+    engineNode: null,   squealNode: null,
+    engineGain: null,   squealGain: null,
+    masterGain: null,
+    smoothedSqueal: 0
+};
+
+const AUDIO_PATHS = {
+    engine: 'sounds/engine.mp3',
+    squeal: 'sounds/squeal.mp3'
+};
+
+async function _loadAudio( ctx, url ) {
+
+    const res = await fetch( import.meta.env.BASE_URL + url );
+    const buf = await res.arrayBuffer();
+    return await ctx.decodeAudioData( buf );
+
+}
+
+async function startAudio() {
+
+    if ( audio.started ) return;
+    audio.started = true;
+
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if ( ! Ctx ) return;
+    const ctx = new Ctx();
+    audio.ctx = ctx;
+
+    audio.masterGain = ctx.createGain();
+    audio.masterGain.gain.value = 0.4;
+    audio.masterGain.connect( ctx.destination );
+
+    try {
+
+        [ audio.engineBuffer, audio.squealBuffer ] = await Promise.all( [
+            _loadAudio( ctx, AUDIO_PATHS.engine ),
+            _loadAudio( ctx, AUDIO_PATHS.squeal )
+        ] );
+
+    } catch ( err ) {
+
+        console.warn( '[audio] failed to load:', err );
+        return;
+
+    }
+
+    audio.engineNode = ctx.createBufferSource();
+    audio.engineNode.buffer = audio.engineBuffer;
+    audio.engineNode.loop = true;
+    // First playback runs from the start of the file (the engine-startup
+    // transient sounds right). Once we hit the end and wrap, skip the first
+    // 3 seconds so the looped section is just the steady idle.
+    audio.engineNode.loopStart = 3.0;
+    audio.engineNode.loopEnd = audio.engineBuffer.duration;
+    audio.engineGain = ctx.createGain();
+    audio.engineGain.gain.value = 0.2;
+    audio.engineNode.connect( audio.engineGain ).connect( audio.masterGain );
+    audio.engineNode.start();
+
+    audio.squealNode = ctx.createBufferSource();
+    audio.squealNode.buffer = audio.squealBuffer;
+    audio.squealNode.loop = true;
+    audio.squealGain = ctx.createGain();
+    audio.squealGain.gain.value = 0;
+    audio.squealNode.connect( audio.squealGain ).connect( audio.masterGain );
+    audio.squealNode.start();
+
+}
+
+// Short, punchy synthesized gear-shift sound. Two layers: a low ~180→60 Hz
+// thump (square osc) and a 30 ms highpassed noise burst tick on top. Free —
+// no asset, < 100 ms total, called every time the gear actually changes.
+function playShiftSound() {
+
+    if ( ! audio.started || ! audio.ctx || ! audio.masterGain ) return;
+    const ctx = audio.ctx;
+    const now = ctx.currentTime;
+
+    // Thump
+    const osc = ctx.createOscillator();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime( 180, now );
+    osc.frequency.exponentialRampToValueAtTime( 60, now + 0.06 );
+    const oscGain = ctx.createGain();
+    oscGain.gain.setValueAtTime( 0.18, now );
+    oscGain.gain.exponentialRampToValueAtTime( 0.001, now + 0.08 );
+    osc.connect( oscGain ).connect( audio.masterGain );
+    osc.start( now );
+    osc.stop( now + 0.1 );
+
+    // Tick (highpassed white-noise burst with linear decay envelope baked in)
+    const len = Math.floor( ctx.sampleRate * 0.03 );
+    const buf = ctx.createBuffer( 1, len, ctx.sampleRate );
+    const d = buf.getChannelData( 0 );
+    for ( let i = 0; i < len; i ++ ) d[ i ] = ( Math.random() * 2 - 1 ) * ( 1 - i / len );
+    const noise = ctx.createBufferSource();
+    noise.buffer = buf;
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.value = 0.12;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 1800;
+    noise.connect( hp ).connect( noiseGain ).connect( audio.masterGain );
+    noise.start( now );
+
+}
+
+function updateAudio( dt ) {
+
+    if ( ! audio.started || ! audio.engineGain || ! vehicleController ) return;
+
+    // Engine pitch from RPM. Idle (~900) → 1.0, redline (~7500) → ~3.0.
+    // Map rpm linearly to playbackRate ∈ [0.55, 2.8] for an audible spread.
+    const rpmNorm = Math.max( 0, Math.min( 1, ( engine.rpm - 800 ) / ( engine.redline - 800 ) ) );
+    const targetRate = 0.55 + rpmNorm * 2.25;
+    // Smooth pitch using setTargetAtTime so abrupt RPM jumps (gear changes)
+    // don't click.
+    audio.engineNode.playbackRate.setTargetAtTime( targetRate, audio.ctx.currentTime, 0.08 );
+
+    // Engine volume: base idle + throttle contribution. Soft floor so even at
+    // 0 throttle you hear a quiet idle.
+    const engineVol = 0.15 + input.throttle * 0.5 + rpmNorm * 0.2;
+    audio.engineGain.gain.setTargetAtTime( engineVol, audio.ctx.currentTime, 0.05 );
+
+    // Skid: take max abs side impulse across the four wheels, normalize, and
+    // smooth so the squeal fades in instead of popping.
+    let maxSide = 0;
+    for ( let i = 0; i < 4; i ++ ) {
+
+        const s = Math.abs( vehicleController.wheelSideImpulse( i ) );
+        if ( s > maxSide ) maxSide = s;
+
+    }
+    // Only count squeal when wheels are actually in contact AND we're moving.
+    const speed = Math.abs( vehicleController.currentVehicleSpeed() );
+    const inAir = ! vehicleController.wheelIsInContact( 0 ) && ! vehicleController.wheelIsInContact( 1 )
+        && ! vehicleController.wheelIsInContact( 2 ) && ! vehicleController.wheelIsInContact( 3 );
+    let squealRaw = 0;
+    if ( ! inAir && speed > 2 ) {
+
+        // Empirical: side impulse of ~6+ on a wheel = strong squeal.
+        squealRaw = Math.max( 0, Math.min( 1, ( maxSide - 1.5 ) / 5.0 ) );
+
+    }
+    const a = 1 - Math.exp( - 8 * dt );
+    audio.smoothedSqueal += ( squealRaw - audio.smoothedSqueal ) * a;
+    audio.squealGain.gain.setTargetAtTime( audio.smoothedSqueal * 0.6, audio.ctx.currentTime, 0.03 );
+
+}
+
 // On-screen touch controls. Activated when the device looks touch-only
 // (touchscreen present + no hover/fine pointer), or hidden when a gamepad
 // connects. Feeds touch.* into updateInput() in the standard merge path.
@@ -230,6 +392,12 @@ async function init() {
     initSpeedometer();
     initStatsForNerds();
     initTouchControls();
+
+    // First user gesture unlocks the AudioContext on every browser.
+    const unlockAudio = () => { startAudio(); };
+    window.addEventListener( 'keydown', unlockAudio, { once: true } );
+    window.addEventListener( 'pointerdown', unlockAudio, { once: true } );
+    window.addEventListener( 'touchstart', unlockAudio, { once: true } );
 
     window.addEventListener( 'keydown', ( event ) => {
 
@@ -1493,6 +1661,7 @@ function manualShift( direction ) {
     if ( next < - 1 || next > 5 ) return;
     transmission.gear = next;
     transmission.shiftCooldown = 0.15;
+    playShiftSound();
 
 }
 
@@ -1538,6 +1707,7 @@ function updateTransmission( dt, speed ) {
 
         transmission.gear = - 1;
         transmission.shiftCooldown = 0.2;
+        playShiftSound();
         return;
 
     }
@@ -1545,6 +1715,7 @@ function updateTransmission( dt, speed ) {
 
         transmission.gear = 1;
         transmission.shiftCooldown = 0.2;
+        playShiftSound();
         return;
 
     }
@@ -1556,6 +1727,7 @@ function updateTransmission( dt, speed ) {
 
         transmission.gear = 1;
         transmission.shiftCooldown = 0.15;
+        playShiftSound();
         return;
 
     }
@@ -1565,6 +1737,7 @@ function updateTransmission( dt, speed ) {
 
         transmission.gear += 1;
         transmission.shiftCooldown = 0.25;
+        playShiftSound();
         return;
 
     }
@@ -1574,6 +1747,7 @@ function updateTransmission( dt, speed ) {
 
         transmission.gear -= 1;
         transmission.shiftCooldown = 0.25;
+        playShiftSound();
 
     }
 
@@ -1787,6 +1961,8 @@ function animate( time ) {
 
         statsForNerds.lastDelta = delta;
         updateStatsForNerds( speed );
+
+        updateAudio( delta );
 
     }
 
