@@ -371,6 +371,35 @@ function showCarToast( name ) {
 
 }
 
+// Generic toast — used for driver-assist toggles (ABS / TC on / off). Reuses
+// the same overlay element as showCarToast so the visual style stays
+// consistent and they don't fight for screen space.
+function showToast( text ) {
+
+    if ( ! carToastEl ) return;
+    carToastEl.textContent = text;
+    carToastEl.style.opacity = '1';
+    if ( _carToastTimer ) clearTimeout( _carToastTimer );
+    _carToastTimer = setTimeout( () => { carToastEl.style.opacity = '0'; }, 1200 );
+
+}
+
+function toggleTractionControl() {
+
+    tcCfg.enabled = ! tcCfg.enabled;
+    showToast( tcCfg.enabled ? 'TC ON' : 'TC OFF' );
+    console.log( '[assists] TC →', tcCfg.enabled ? 'ON' : 'OFF' );
+
+}
+
+function toggleAbs() {
+
+    absCfg.enabled = ! absCfg.enabled;
+    showToast( absCfg.enabled ? 'ABS ON' : 'ABS OFF' );
+    console.log( '[assists] ABS →', absCfg.enabled ? 'ON' : 'OFF' );
+
+}
+
 // ---------------- camber + toe (suspension geometry) ----------------
 // Rapier's vehicle controller can't tilt wheel axles out of the suspension
 // plane, so we approximate camber's effect on lateral grip by modulating
@@ -451,7 +480,10 @@ const drivetrain = {
     // Traction-control telemetry — updated each frame by applyVehicleForces.
     // `cutPct` is the largest fractional torque cut across driven wheels, in
     // [0,1]. `engaged` is sticky for ~120ms so the UI light stays visible.
-    tc: { cutPct: 0, engaged: false, engagedUntil: 0, eventCount: 0 }
+    tc: { cutPct: 0, engaged: false, engagedUntil: 0, eventCount: 0 },
+    // ABS telemetry — symmetric to TC but for the brake side. cutPct is the
+    // largest fractional brake-force cut across the four wheels this frame.
+    abs: { cutPct: 0, engaged: false, engagedUntil: 0, eventCount: 0 }
 };
 
 function resetDrivetrain() {
@@ -2822,6 +2854,8 @@ async function swapEngineAudio( car ) {
 // When a gamepad connects we swap to the controller scheme — otherwise we
 // show the keyboard one. The scheme renders into #controlsList; the volume
 // slider above and the minimap toggle below stay put as siblings.
+// A PlayStation variant (CONTROLS_GAMEPAD_PS) exists alongside the Xbox
+// scheme for DualShock / DualSense pads — selected via controllerKind().
 
 const CONTROLS_KEYBOARD = [
     'W / ↑ · throttle',
@@ -2835,14 +2869,16 @@ const CONTROLS_KEYBOARD = [
     'R · reset',
     'C · cycle camera (chase / free / pov)',
     '1 / 2 · cycle map',
+    'B · toggle ABS    ·    N · toggle traction control',
     'T · record 60s telemetry (input + output → JSON)'
 ];
 
 const CONTROLS_GAMEPAD = [
     'LS · steer',
     'RT · throttle',
-    'LT · brake · hold = reverse',
+    'LT · brake · hold full 2s @ stop = reverse',
     'A · handbrake',
+    'B · toggle ABS',
     'X · auto / manual',
     'Back · cycle car',
     'RB · upshift  ·  LB · downshift',
@@ -2850,7 +2886,25 @@ const CONTROLS_GAMEPAD = [
     'Y · cycle camera (chase / free / pov)',
     'D-pad → · cycle map',
     'D-pad ← · toggle minimap',
-    'D-pad ↑ · stats for nerds'
+    'D-pad ↑ · stats for nerds',
+    'D-pad ↓ · toggle traction control'
+];
+
+const CONTROLS_GAMEPAD_PS = [
+    'LS · steer',
+    'R2 · throttle',
+    'L2 · brake · hold full 2s @ stop = reverse',
+    '✕ · handbrake',
+    '● · toggle ABS',
+    '■ · auto / manual',
+    'Share · cycle car',
+    'R1 · upshift  ·  L1 · downshift',
+    'Options · reset',
+    '▲ · cycle camera (chase / free / pov)',
+    'D-pad → · cycle map',
+    'D-pad ← · toggle minimap',
+    'D-pad ↑ · stats for nerds',
+    'D-pad ↓ · toggle traction control'
 ];
 
 function renderControlsCheatsheet() {
@@ -2858,7 +2912,8 @@ function renderControlsCheatsheet() {
     const list = document.getElementById( 'controlsList' );
     if ( ! list ) return;
 
-    const scheme = gamepad.index >= 0 ? CONTROLS_GAMEPAD : CONTROLS_KEYBOARD;
+    const kind = controllerKind();
+    const scheme = kind === 'ps' ? CONTROLS_GAMEPAD_PS : kind === 'xbox' ? CONTROLS_GAMEPAD : CONTROLS_KEYBOARD;
     list.innerHTML = '';
     for ( const line of scheme ) {
 
@@ -3111,6 +3166,10 @@ const input = {
     keyR: false, keySpace: false,
     // S-held timer for long-press reverse engagement
     sHeldTime: 0,
+    // Gamepad LT-held-at-full timer for reverse engagement. Triggers when
+    // LT is held at value > 0.95 for > 2 s while the car is essentially
+    // stopped — keyboard/touch already have their own faster (0.3 s) path.
+    padBrakeFullTime: 0,
     reverseEngaged: false,
     // Initial-spawn / post-R-reset handbrake lock — gravity can roll the
     // chassis on inclined spawns and we don't want the car drifting before
@@ -3144,15 +3203,37 @@ const steeringCfg = {
 // longitudinal slip ratio exceeds the peak-grip threshold. Without this,
 // stomping the throttle mid-corner sends the drive tyres past peak slip and
 // the car washes wide / spins. Live state is mirrored to `drivetrain.tc`
-// for the stats panel.
+// for the stats panel. Toggle with N (keyboard) / D-pad down (gamepad).
 const tcCfg = {
     enabled: true,
     slipThreshold: 0.16,        // peak Pacejka slip is ~0.14
     cutGain: 4.5,               // torque cut per unit of slip overshoot
     minMult: 0.18,              // never cut all the way to zero
-    // Low-speed exemption: TC is annoying when crawling out of a spawn /
-    // doing a hill-start, so disable below this speed (m/s).
-    minActiveSpeed: 1.2
+    // Low-speed exemption: below this speed TC is fully off. The slip-ratio
+    // math is mathematically unstable here (divides by tiny speed) and we
+    // don't want to choke launches from a standstill / uphill / sand.
+    minActiveSpeed: 1.2,
+    // Speed-based fade-in: between minActiveSpeed and fadeInSpeed the TC
+    // cut amount scales from 0 → full so it doesn't snap from "no cut" to
+    // "−82%" the moment we cross 1.2 m/s. Without this the player gets
+    // stuck at ~4 km/h on any slope — throttle dies on hill starts.
+    fadeInSpeed: 6.0,
+    // Per-car grip scaling: cars with higher wheelFrictionSlip get
+    // proportionally more slip headroom before TC engages.
+    gripScale: 0.10
+};
+
+// ABS — cuts brake force per-wheel when the longitudinal slip ratio
+// exceeds the threshold under braking. Without it, stomping the brake
+// locks all four wheels, kills lateral grip, and makes trailbraking
+// impossible. Same shape as TC but on the brake side. Toggle with B
+// (keyboard) / B-button (gamepad).
+const absCfg = {
+    enabled: true,
+    slipThreshold: 0.18,        // a touch wider than TC — braking slip is harder to recover from
+    cutGain: 5.0,
+    minMult: 0.20,
+    minActiveSpeed: 1.5         // exempt at crawl so we don't release-pulse the handbrake/parking brake
 };
 
 // Per-frame steering-pipeline telemetry — populated by applyVehicleForces,
@@ -3312,27 +3393,32 @@ const CARS = [
         Cd: 0.0182, Cl: 0.0140,
         driveType: 'RWD'
     },
-    // F1 — 798 kg open-wheeler with V10-era 18000 rpm scream.
-    // Terrifying at low speed (peaky power, no aero), sublime at high speed (multi-g
-    // downforce grip). Stiff as a board, slick rubber, ~340 km/h.
+    // F1 — V10-era open-wheeler tuned FOR THIS ENGINE, not for a sim.
+    // Rationale: in our physics, mass=5 + force=235 + stiff/low suspension
+    // produced ~20g RWD wheelspin on every throttle blip and snap-oversteer
+    // off any kerb. Re-targeted to "demanding but drivable" — heaviest car
+    // in the fleet by power-to-mass is still F1, but the chassis now has
+    // enough suspension travel + forgiving toe/camber + progressive throttle
+    // (engineInertia up, torque band wider) that the player can actually
+    // attack corners. Aero still dominates above 200 km/h. ~330–345 km/h.
     {
         name: 'F1',
         bodyColor: 0xD11A1A,
         soundFile: 'sounds/engines/f1.mp3', soundLoopStart: 3.0,
         pitchMin: 1.0, pitchMax: 4.0,
-        mass: 5, chassisFriction: 0.92,
-        maxEngineForce: 235, engineIdleRpm: 4500, engineRedline: 18500,
-        peakTorqueRpm: 14000, torqueCurveWidth: 3200,
-        gearRatios: [ 2.90, 2.20, 1.75, 1.42, 1.18, 1.0, 0.86, 0.74 ], reverseRatio: - 2.5, finalDrive: 4.4,
-        autoUpshiftRpm: 18000, autoDownshiftRpm: 7000,
-        wheelFrictionSlip: 4.4,
-        suspensionStiffness: 58, suspensionCompression: 3.5, suspensionRelaxation: 3.7,
-        suspensionRestLength: 0.16, wheelConnectionY: - 0.18,
-        maxBrakeForce: 3.5, handbrakeMultiplier: 1.4, maxSteeringAngle: Math.PI / 4.5,
-        brakeBias: 0.58,
-        camberDeg: [ - 3.5, - 3.5, - 2.0, - 2.0 ], toeDeg: [ - 0.2, - 0.2, 0.25, 0.25 ],
-        engineInertia: 0.04, clutchStiffness: 900, lsdLocking: 1.00,
-        Cd: 0.0220, Cl: 0.0600,
+        mass: 7, chassisFriction: 0.92,
+        maxEngineForce: 200, engineIdleRpm: 4500, engineRedline: 17500,
+        peakTorqueRpm: 12000, torqueCurveWidth: 4500,
+        gearRatios: [ 2.90, 2.20, 1.75, 1.42, 1.18, 1.0, 0.86, 0.74 ], reverseRatio: - 2.5, finalDrive: 4.0,
+        autoUpshiftRpm: 16500, autoDownshiftRpm: 6500,
+        wheelFrictionSlip: 4.2,
+        suspensionStiffness: 44, suspensionCompression: 3.0, suspensionRelaxation: 3.3,
+        suspensionRestLength: 0.22, wheelConnectionY: - 0.22,
+        maxBrakeForce: 3.2, handbrakeMultiplier: 1.4, maxSteeringAngle: Math.PI / 5.0,
+        brakeBias: 0.62,
+        camberDeg: [ - 2.5, - 2.5, - 1.5, - 1.5 ], toeDeg: [ - 0.1, - 0.1, 0.15, 0.15 ],
+        engineInertia: 0.07, clutchStiffness: 800, lsdLocking: 1.00,
+        Cd: 0.0190, Cl: 0.0420,
         driveType: 'RWD'
     },
     // God Car — physically impossible: max grip, 10 gears, flat torque, near-instant stops.
@@ -3405,6 +3491,23 @@ const gamepad = {
     prevButtons: []
 };
 
+// Classify the active pad so the cheatsheet can show vendor-correct labels.
+// Button wiring (pollGamepad) is the standard Gamepad API mapping for both
+// vendors — only the on-screen labels change.
+function controllerKind() {
+
+    if ( gamepad.index < 0 ) return 'none';
+    const id = ( gamepad.id || '' ).toLowerCase();
+    const psHints = [ 'dualsense', 'dualshock', 'playstation', 'ps3', 'ps4', 'ps5', '054c', '0810' ];
+    for ( const hint of psHints ) {
+
+        if ( id.includes( hint ) ) return 'ps';
+
+    }
+    return 'xbox';
+
+}
+
 // Spawn pose captured live from driving the car onto the road and pressing P.
 // Mutated by swapMap() so the chassis-reset code path (input.reset) always
 // reads the active map's spawn.
@@ -3429,9 +3532,9 @@ const MAPS = {
         // Captured pose from the 5.5× session, rescaled by 2/5.5 so the
         // car still lands on the same on-asphalt point at the new scale.
         // Press P on-track if you want a tighter spawn.
-        spawnPos: { x: 26.04, y: 26.09, z: 1219.19 },
-        spawnRot: { x: 0.0037, y: - 0.0176, z: 0.0121, w: - 0.9998 }
-    }
+        spawnPos: { x: 26.17, y: 26.07, z: 1219.19 },
+        spawnRot: { x: 0.0037, y: - 0.0175, z: 0.0121, w: - 0.9998 }
+    },
 };
 let currentMapId = 'nurburgring';
 let mapSwapInFlight = false;
@@ -3558,7 +3661,6 @@ async function init() {
 
     initSpeedometer();
     initStatsForNerds();
-    initJoystickMap();
     initTouchControls();
     initCarToast();
     initMinimap();
@@ -3621,6 +3723,9 @@ async function init() {
             else stopTelemetryRecording( /* download */ true );
 
         }
+
+        if ( k === 'b' || k === 'B' ) toggleAbs();
+        if ( k === 'n' || k === 'N' ) toggleTractionControl();
 
         if ( k === 'p' || k === 'P' ) {
 
@@ -4064,6 +4169,7 @@ async function swapMap( id ) {
         engine.rpm = engine.idleRpm;
         input.reverseEngaged = false;
         input.sHeldTime = 0;
+        input.padBrakeFullTime = 0;
         input.handbrakeAfterReset = true;
         chaseCam.initialized = false;
         resetTires();
@@ -4703,37 +4809,23 @@ function pushAndDrawMultiGraph( id, values ) {
 
 // ---------------- joystick directional map ----------------
 //
-// Always-visible 110×110 widget pinned top-left. X axis = steering, Y axis =
-// throttle (up) / brake (down). Two dots overlap: a faint dot for the raw
+// Embedded inside the stats-for-nerds panel — 108×108 canvas centered in a
+// dedicated section. X axis = steering (left = left, right = right), Y axis
+// = throttle (up) / brake (down). Two dots overlap: a faint dot for the raw
 // merged input (pre-shape) and a bright dot for the shaped value that the
 // physics actually uses. Useful for spotting controller drift, asymmetric
 // inputs, and the steering curve's reshaping at a glance.
 
 const joystickMap = {
-    el: null,
     canvas: null,
     ctx: null,
     subEl: null
 };
 
-function initJoystickMap() {
+function initJoystickMap( parent ) {
 
     const wrap = document.createElement( 'div' );
-    wrap.id = 'joystickMap';
-    wrap.style.cssText = [
-        'position:absolute', 'top:10px', 'left:10px',
-        'padding:6px 7px 4px', 'background:rgba(0,0,0,0.55)',
-        'border:1px solid rgba(255,255,255,0.18)', 'border-radius:6px',
-        'color:#fff', 'font:10px Monospace', 'z-index:3',
-        'box-shadow:0 4px 16px rgba(0,0,0,0.45)',
-        'user-select:none', 'pointer-events:none',
-        'display:flex', 'flex-direction:column', 'align-items:center'
-    ].join( ';' );
-
-    const label = document.createElement( 'div' );
-    label.textContent = 'INPUT';
-    label.style.cssText = 'letter-spacing:1.5px;opacity:0.7;margin-bottom:3px;font-size:9px';
-    wrap.appendChild( label );
+    wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;margin-top:6px';
 
     const canvas = document.createElement( 'canvas' );
     canvas.width = 108;
@@ -4746,8 +4838,7 @@ function initJoystickMap() {
     sub.textContent = 'S 0.00 · T 0.00';
     wrap.appendChild( sub );
 
-    document.body.appendChild( wrap );
-    joystickMap.el = wrap;
+    parent.appendChild( wrap );
     joystickMap.canvas = canvas;
     joystickMap.ctx = canvas.getContext( '2d' );
     joystickMap.subEl = sub;
@@ -4787,14 +4878,16 @@ function renderJoystickMap() {
     // Vertical axis is throttle (up) and brake (down). We map their
     // difference so the dot sits at the dominant pedal — brake-only goes
     // down, throttle-only goes up, both pressed cancels toward center.
-    const sx = cx + input.steer * r;
+    // X axis is negated because the keyboard convention is A → +steer
+    // (engine turns left), but on a stick map we want left input → left dot.
+    const sx = cx - input.steer * r;
     const verticalAxis = input.throttle - input.brake;
     const sy = cy - verticalAxis * r;
 
     // Raw merged input (pre-shape) — faint dot. When the wheel curve is
     // softening the input, this dot sits further from center than the
     // bright one, making the curve visible at a glance.
-    const rx = cx + input.steerRaw * r;
+    const rx = cx - input.steerRaw * r;
     ctx.fillStyle = 'rgba(255,255,255,0.30)';
     ctx.beginPath();
     ctx.arc( rx, sy, 3, 0, Math.PI * 2 );
@@ -4812,14 +4905,31 @@ function renderJoystickMap() {
     ctx.arc( sx, sy, 4.5, 0, Math.PI * 2 );
     ctx.fill();
 
-    // Status badges — TC (red) when traction control is biting, HB (cyan)
-    // when handbrake is pulled, REC + countdown when telemetry is recording.
+    // Status badges. Top-right column: TC (red engaged / grey OFF) above
+    // ABS (cyan engaged / grey OFF). Top-left: HB (cyan) when handbrake is
+    // pulled. Bottom-left: REC + countdown when telemetry is recording.
     ctx.font = 'bold 9px Monospace';
-    if ( drivetrain.tc.engaged ) {
+    ctx.textAlign = 'right';
+    if ( ! tcCfg.enabled ) {
+
+        ctx.fillStyle = 'rgba(200,200,200,0.55)';
+        ctx.fillText( 'TC OFF', w - 4, 11 );
+
+    } else if ( drivetrain.tc.engaged ) {
 
         ctx.fillStyle = 'rgba(255,90,90,0.90)';
-        ctx.textAlign = 'right';
         ctx.fillText( 'TC', w - 4, 11 );
+
+    }
+    if ( ! absCfg.enabled ) {
+
+        ctx.fillStyle = 'rgba(200,200,200,0.55)';
+        ctx.fillText( 'ABS OFF', w - 4, 22 );
+
+    } else if ( drivetrain.abs.engaged ) {
+
+        ctx.fillStyle = 'rgba(120,200,255,0.90)';
+        ctx.fillText( 'ABS', w - 4, 22 );
 
     }
     if ( input.handbrake > 0.5 ) {
@@ -4881,11 +4991,13 @@ function stopTelemetryRecording( download ) {
         recordedAt: new Date().toISOString(),
         car: currentCar.name,
         driveType: currentCar.driveType,
+        brakeBias: currentCar.brakeBias != null ? currentCar.brakeBias : 0.5,
         map: currentMapId,
         durationMs: Math.round( elapsedMs ),
         sampleCount,
         steeringCfg: { ...steeringCfg },
         tcCfg: { ...tcCfg },
+        absCfg: { ...absCfg },
         samples: telemetry.samples
     };
     const blob = new Blob( [ JSON.stringify( payload ) ], { type: 'application/json' } );
@@ -4957,6 +5069,7 @@ function captureTelemetrySample( now ) {
             gear: transmission.gear,
             rpm: engine.rpm,
             tcCutPct: drivetrain.tc.cutPct,
+            absCutPct: drivetrain.abs.cutPct,
             pos: [ t.x, t.y, t.z ],
             rot: [ q.x, q.y, q.z, q.w ],
             vel: [ v.x, v.y, v.z ],
@@ -5022,6 +5135,7 @@ function initStatsForNerds() {
     _sStat( drive, 'deadzone state', 's_deadzone', 'IN means raw input is inside the deadzone and snapped to 0' );
     _sStat( drive, 'handbrake', 's_handbrake' );
     _sStat( drive, 'reverse engaged', 's_reverse' );
+    initJoystickMap( drive );
 
     const steer = _sSection( panel, 'STEERING PIPELINE' );
     _sStat( steer, 'max angle', 's_maxAngle', 'speed-scaled mechanical max steering angle' );
@@ -5035,12 +5149,19 @@ function initStatsForNerds() {
         [ 'raw', 'shaped', 'actual' ],
         - 1.1, 1.1 );
 
-    const tc = _sSection( panel, 'TRACTION CONTROL' );
+    const tc = _sSection( panel, 'TRACTION CONTROL (N)' );
     _sStat( tc, 'status', 's_tc_status', 'ON / OFF / ENGAGED — engaged is sticky for ~120ms' );
     _sStat( tc, 'cut %', 's_tc_cut', 'largest fractional torque cut across driven wheels this frame' );
     _sStat( tc, 'events', 's_tc_count', 'number of distinct TC engagements since session start' );
     _sStat( tc, 'thresholds', 's_tc_cfg', 'slip threshold · cut gain · min mult' );
     _sGraph( panel, 'TC cut %', 'g_tc', 280, 28, '#FF6464', 0, 1 );
+
+    const ab = _sSection( panel, 'ABS (B)' );
+    _sStat( ab, 'status', 's_abs_status', 'ON / OFF / ENGAGED — engaged is sticky for ~120ms' );
+    _sStat( ab, 'cut %', 's_abs_cut', 'largest fractional brake cut across the four wheels this frame' );
+    _sStat( ab, 'events', 's_abs_count', 'number of distinct ABS engagements since session start' );
+    _sStat( ab, 'brake bias', 's_abs_bias', 'fraction of total brake force routed to the front axle' );
+    _sGraph( panel, 'ABS cut %', 'g_abs', 280, 28, '#64C8FF', 0, 1 );
 
     const rec = _sSection( panel, 'TELEMETRY RECORDER (T)' );
     _sStat( rec, 'state', 's_rec_state' );
@@ -5157,6 +5278,7 @@ function updateStatsForNerds( speed ) {
         carMax > 0 ? steeringTelemetry.actual / carMax : 0
     ] );
     pushAndDrawGraph( 'g_tc', drivetrain.tc.cutPct );
+    pushAndDrawGraph( 'g_abs', drivetrain.abs.cutPct );
     updateTireWidget();
 
     if ( ! statsForNerds.enabled || ! chassis ) return;
@@ -5189,6 +5311,16 @@ function updateStatsForNerds( speed ) {
     _sset( 's_tc_cut', `${ ( drivetrain.tc.cutPct * 100 ).toFixed( 1 ) }%` );
     _sset( 's_tc_count', String( drivetrain.tc.eventCount ) );
     _sset( 's_tc_cfg', `${ tcCfg.slipThreshold.toFixed( 2 ) } · ${ tcCfg.cutGain.toFixed( 1 ) } · ${ tcCfg.minMult.toFixed( 2 ) }` );
+
+    // ABS diagnostics.
+    const absStatus = ! absCfg.enabled ? 'OFF'
+        : drivetrain.abs.engaged ? 'ENGAGED'
+        : 'armed';
+    _sset( 's_abs_status', absStatus );
+    _sset( 's_abs_cut', `${ ( drivetrain.abs.cutPct * 100 ).toFixed( 1 ) }%` );
+    _sset( 's_abs_count', String( drivetrain.abs.eventCount ) );
+    const bias = currentCar.brakeBias != null ? currentCar.brakeBias : 0.5;
+    _sset( 's_abs_bias', `F ${ ( bias * 100 ).toFixed( 0 ) } : R ${ ( ( 1 - bias ) * 100 ).toFixed( 0 ) }` );
 
     // Telemetry recorder.
     if ( telemetry.recording ) {
@@ -5607,15 +5739,44 @@ function steeringSpeedFactor( speed ) {
 
 // Per-driven-wheel traction-control multiplier. Returns 1.0 when slip is in
 // the safe range, then ramps down toward `minMult` as slip exceeds the
-// threshold. Side-effect: bumps the drivetrain.tc telemetry so the stats
-// panel can show when TC engaged.
-function tractionCutFactor( slipRatio, speed ) {
+// per-car threshold. The slip ratio is clamped at low vehicle speed because
+// the slipRatio = (wheelV − bodyV)/bodyV math blows up as bodyV → 0 and
+// otherwise TC chokes throttle on every hill-start / sand-launch.
+function tractionCutFactor( slipRatio, speed, car ) {
 
     if ( ! tcCfg.enabled ) return 1;
-    if ( Math.abs( speed ) < tcCfg.minActiveSpeed ) return 1;
-    const excess = Math.abs( slipRatio ) - tcCfg.slipThreshold;
+    const absSpeed = Math.abs( speed );
+    if ( absSpeed < tcCfg.minActiveSpeed ) return 1;
+    const carGrip = car ? ( car.wheelFrictionSlip || 2.0 ) : 2.0;
+    const threshold = tcCfg.slipThreshold * ( 1 + ( carGrip - 2.0 ) * tcCfg.gripScale );
+    const excess = Math.abs( slipRatio ) - threshold;
     if ( excess <= 0 ) return 1;
-    return Math.max( tcCfg.minMult, 1 - excess * tcCfg.cutGain );
+    let cut = excess * tcCfg.cutGain;
+    // Smooth fade-in: TC strength scales from 0 (at minActiveSpeed) to 1
+    // (at fadeInSpeed) so accelerating out of standstill / uphill / sand
+    // doesn't snap into a hard torque cut the moment we leave the exemption.
+    if ( absSpeed < tcCfg.fadeInSpeed ) {
+
+        const fade = ( absSpeed - tcCfg.minActiveSpeed ) / ( tcCfg.fadeInSpeed - tcCfg.minActiveSpeed );
+        cut *= Math.max( 0, Math.min( 1, fade ) );
+
+    }
+    return Math.max( tcCfg.minMult, 1 - cut );
+
+}
+
+// ABS multiplier — cuts brake force on a wheel when its slip ratio is past
+// the lock-up threshold, restoring lateral grip so steering still works
+// during heavy braking. Same shape as TC but reads the brake side.
+function absModulate( brakeForce, slipRatio, speed ) {
+
+    if ( ! absCfg.enabled ) return brakeForce;
+    if ( brakeForce <= 0 ) return brakeForce;
+    if ( Math.abs( speed ) < absCfg.minActiveSpeed ) return brakeForce;
+    const excess = Math.abs( slipRatio ) - absCfg.slipThreshold;
+    if ( excess <= 0 ) return brakeForce;
+    const mult = Math.max( absCfg.minMult, 1 - excess * absCfg.cutGain );
+    return brakeForce * mult;
 
 }
 
@@ -5635,20 +5796,24 @@ function pollGamepad() {
     const prev = gamepad.prevButtons;
     const rb = pad.buttons[ 5 ] && pad.buttons[ 5 ].pressed;
     const lb = pad.buttons[ 4 ] && pad.buttons[ 4 ].pressed;
+    const b = pad.buttons[ 1 ] && pad.buttons[ 1 ].pressed; // B — toggle ABS
     const x = pad.buttons[ 2 ] && pad.buttons[ 2 ].pressed; // mode toggle
     const y = pad.buttons[ 3 ] && pad.buttons[ 3 ].pressed; // camera toggle
     const back = pad.buttons[ 8 ] && pad.buttons[ 8 ].pressed; // Back / Select / Share — cycle car
     const start = pad.buttons[ 9 ] && pad.buttons[ 9 ].pressed; // reset
     const dUp = pad.buttons[ 12 ] && pad.buttons[ 12 ].pressed; // D-pad up — stats for nerds
+    const dDown = pad.buttons[ 13 ] && pad.buttons[ 13 ].pressed; // D-pad down — toggle TC
     const dLeft = pad.buttons[ 14 ] && pad.buttons[ 14 ].pressed; // D-pad left — minimap
     const dRight = pad.buttons[ 15 ] && pad.buttons[ 15 ].pressed; // D-pad right — cycle map
 
     if ( rb && ! prev[ 5 ] && transmission.mode === 'manual' ) manualShift( 1 );
     if ( lb && ! prev[ 4 ] && transmission.mode === 'manual' ) manualShift( - 1 );
+    if ( b && ! prev[ 1 ] ) toggleAbs();
     if ( x && ! prev[ 2 ] ) toggleTransmissionMode();
     if ( y && ! prev[ 3 ] ) cycleCameraMode();
     if ( back && ! prev[ 8 ] ) cycleCar( 1 );
     if ( dUp && ! prev[ 12 ] ) toggleStatsForNerds();
+    if ( dDown && ! prev[ 13 ] ) toggleTractionControl();
     if ( dLeft && ! prev[ 14 ] ) toggleMinimap();
     if ( dRight && ! prev[ 15 ] ) swapMap( currentMapId === 'nurburgring' ? 'nurburgring_gp' : 'nurburgring' );
     if ( start && ! prev[ 9 ] ) input.keyR = true; else if ( ! start && prev[ 9 ] ) input.keyR = false;
@@ -5743,6 +5908,23 @@ function updateInput( dt ) {
     } else if ( reverseTrigger < 0.1 ) {
 
         input.sHeldTime = 0;
+        if ( throttle > 0.1 && transmission.mode === 'auto' ) input.reverseEngaged = false;
+
+    }
+
+    // Gamepad LT-held-at-full reverse trigger. Triggers and binary-pedal
+    // paths are intentionally separate because LT is naturally held hard
+    // when braking down to a stop — we use a longer dwell (2 s) and a high
+    // pressure threshold (> 0.95) so it doesn't fire on a normal hard stop.
+    const padBrake = pad ? pad.brake : 0;
+    if ( padBrake > 0.95 && speed < 0.6 ) {
+
+        input.padBrakeFullTime += dt;
+        if ( input.padBrakeFullTime > 2.0 ) input.reverseEngaged = true;
+
+    } else if ( padBrake < 0.5 ) {
+
+        input.padBrakeFullTime = 0;
         if ( throttle > 0.1 && transmission.mode === 'auto' ) input.reverseEngaged = false;
 
     }
@@ -5873,6 +6055,7 @@ function applyVehicleForces( speed, dt ) {
         engine.rpm = engine.idleRpm;
         input.reverseEngaged = false;
         input.sHeldTime = 0;
+        input.padBrakeFullTime = 0;
         input.handbrakeAfterReset = true;
         chaseCam.initialized = false;
         resetTires();
@@ -5931,7 +6114,7 @@ function applyVehicleForces( speed, dt ) {
             continue;
 
         }
-        const tcMult = tractionCutFactor( tires.slipRatio[ i ], speed );
+        const tcMult = tractionCutFactor( tires.slipRatio[ i ], speed, currentCar );
         const cut = 1 - tcMult;
         if ( cut > frameMaxCut ) frameMaxCut = cut;
         vehicleController.setWheelEngineForce( i, perDriven * tcMult );
@@ -5960,17 +6143,57 @@ function applyVehicleForces( speed, dt ) {
     let serviceBrake = 0;
     if ( ! ( transmission.mode === 'auto' && input.reverseEngaged ) ) {
 
-        // Light brake unless gear opposes motion → use engine braking instead.
         serviceBrake = input.brake * currentCar.maxBrakeForce;
 
     }
     const handbrake = input.handbrake * currentCar.maxBrakeForce * currentCar.handbrakeMultiplier;
 
-    // Service brake on all 4, handbrake biased to rear wheels (indices 2,3).
-    vehicleController.setWheelBrake( 0, serviceBrake );
-    vehicleController.setWheelBrake( 1, serviceBrake );
-    vehicleController.setWheelBrake( 2, Math.max( serviceBrake, handbrake ) );
-    vehicleController.setWheelBrake( 3, Math.max( serviceBrake, handbrake ) );
+    // Brake bias: shift the service brake forward (or rearward) per car.
+    // bias = 0.5 keeps the old equal split; FWD/heavy-nose cars get more
+    // bias so the rear doesn't lock first. Total brake force stays equal
+    // (frontMul + rearMul = 2, so 2*front + 2*rear = 4 * serviceBrake = old).
+    const bias = currentCar.brakeBias != null ? currentCar.brakeBias : 0.5;
+    const frontMul = bias * 2;
+    const rearMul = ( 1 - bias ) * 2;
+    const fbFront = serviceBrake * frontMul;
+    const fbRear = serviceBrake * rearMul;
+
+    // ABS modulation per wheel. Handbrake is applied AFTER ABS so the
+    // handbrake can still lock the rears intentionally (drift / e-brake).
+    const w0 = absModulate( fbFront, tires.slipRatio[ 0 ], speed );
+    const w1 = absModulate( fbFront, tires.slipRatio[ 1 ], speed );
+    const w2 = absModulate( fbRear,  tires.slipRatio[ 2 ], speed );
+    const w3 = absModulate( fbRear,  tires.slipRatio[ 3 ], speed );
+
+    // Telemetry: largest fractional ABS cut across all four wheels this frame.
+    let absMaxCut = 0;
+    if ( fbFront > 0 ) {
+
+        absMaxCut = Math.max( absMaxCut, 1 - w0 / fbFront, 1 - w1 / fbFront );
+
+    }
+    if ( fbRear > 0 ) {
+
+        absMaxCut = Math.max( absMaxCut, 1 - w2 / fbRear, 1 - w3 / fbRear );
+
+    }
+    drivetrain.abs.cutPct = absMaxCut;
+    if ( absMaxCut > 0.02 ) {
+
+        if ( ! drivetrain.abs.engaged ) drivetrain.abs.eventCount += 1;
+        drivetrain.abs.engaged = true;
+        drivetrain.abs.engagedUntil = performance.now() + 120;
+
+    } else if ( performance.now() > drivetrain.abs.engagedUntil ) {
+
+        drivetrain.abs.engaged = false;
+
+    }
+
+    vehicleController.setWheelBrake( 0, w0 );
+    vehicleController.setWheelBrake( 1, w1 );
+    vehicleController.setWheelBrake( 2, Math.max( w2, handbrake ) );
+    vehicleController.setWheelBrake( 3, Math.max( w3, handbrake ) );
 
     // STEERING — non-linear curve (in shapeSteer), speed-scaled mechanical
     // max, and dt-aware smoothing. Toe stays baked in as the *resting*
@@ -6150,7 +6373,7 @@ function animate( time ) {
 
         statsForNerds.lastDelta = delta;
         updateStatsForNerds( speed );
-        renderJoystickMap();
+        if ( statsForNerds.enabled ) renderJoystickMap();
         captureTelemetrySample( performance.now() );
 
         updateAudio( delta );
