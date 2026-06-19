@@ -1632,6 +1632,63 @@ async function swapEngineAudio( car ) {
 
 }
 
+// ---------------- controls cheatsheet ----------------
+//
+// The #info panel in the top-right shows one set of bindings at a time.
+// When a gamepad connects we swap to the controller scheme — otherwise we
+// show the keyboard one. The scheme renders into #controlsList; the volume
+// slider above and the minimap toggle below stay put as siblings.
+
+const CONTROLS_KEYBOARD = [
+    'W / ↑ · throttle',
+    'Space · brake',
+    'S / ↓ · brake · hold = reverse',
+    'A D / ← → · steer',
+    'E · handbrake',
+    'M · auto / manual',
+    'Q · cycle car',
+    'L⇧ · upshift  ·  L⌃ · downshift',
+    'R · reset',
+    'C · cycle camera (chase / free / pov)',
+    '1 / 2 · cycle map'
+];
+
+const CONTROLS_GAMEPAD = [
+    'LS · steer',
+    'RT · throttle',
+    'LT · brake · hold = reverse',
+    'A · handbrake',
+    'X · auto / manual',
+    'Back · cycle car',
+    'RB · upshift  ·  LB · downshift',
+    'Start · reset',
+    'Y · cycle camera (chase / free / pov)',
+    'D-pad → · cycle map',
+    'D-pad ← · toggle minimap',
+    'D-pad ↑ · stats for nerds'
+];
+
+function renderControlsCheatsheet() {
+
+    const list = document.getElementById( 'controlsList' );
+    if ( ! list ) return;
+
+    const scheme = gamepad.index >= 0 ? CONTROLS_GAMEPAD : CONTROLS_KEYBOARD;
+    list.innerHTML = '';
+    for ( const line of scheme ) {
+
+        const p = document.createElement( 'p' );
+        p.textContent = line;
+        list.appendChild( p );
+
+    }
+
+    // Stats-for-nerds toggle position is anchored to #info's bottom edge,
+    // and the panel's height just changed.
+    if ( typeof _positionStatsBelowInfo === 'function' ) _positionStatsBelowInfo();
+
+}
+
 function initVolumeSlider() {
 
     const infoEl = document.getElementById( 'info' );
@@ -2240,6 +2297,7 @@ async function init() {
     initLapTimer();
     initSkidMarks();
     initVolumeSlider();
+    renderControlsCheatsheet();
     _positionStatsBelowInfo();
     window.addEventListener( 'resize', _positionStatsBelowInfo );
 
@@ -2334,6 +2392,7 @@ async function init() {
         gamepad.id = e.gamepad.id;
         if ( speedoControllerEl ) speedoControllerEl.style.display = 'block';
         if ( touch.enabled ) setTouchOverlayVisible( false ); // gamepad wins
+        renderControlsCheatsheet();
         console.log( '[gamepad] connected:', e.gamepad.id );
 
     } );
@@ -2346,6 +2405,7 @@ async function init() {
             gamepad.id = '';
             if ( speedoControllerEl ) speedoControllerEl.style.display = 'none';
             if ( touch.enabled ) setTouchOverlayVisible( true );
+            renderControlsCheatsheet();
 
         }
 

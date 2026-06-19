@@ -2,7 +2,7 @@
 
 ## Latest Commit
 
-- Backfill README ledger with the lap-timer + format-change commits (catches the ledger up to HEAD) **(HEAD)**
+- Swap controls cheatsheet to gamepad bindings when a controller is connected (LS/RT/LT/A/X/Y/Back/Start/bumpers/dpad listed; keyboard scheme restored on disconnect) **(HEAD)**
 
 ## all commits
 
@@ -27,4 +27,5 @@
 - Retune Nürburgring GP spawn pose (lands on asphalt at the new 2× scale) `(f7ea679)`
 - Add lap timer with persistent history and finish-line detection (bottom-left pill with drop-up of past laps + average; arms only on real input; multi-gate anti-cheese on spawn-point crossings) `(c4ba794)`
 - Format README ledger as proper markdown (h2 sections + bullet list) `(d5f5d8a)`
-- Backfill README ledger with the lap-timer + format-change commits (catches the ledger up to HEAD) **(HEAD)**
+- Backfill README ledger with the lap-timer + format-change commits (catches the ledger up to HEAD) `(e170948)`
+- Swap controls cheatsheet to gamepad bindings when a controller is connected (LS/RT/LT/A/X/Y/Back/Start/bumpers/dpad listed; keyboard scheme restored on disconnect) **(HEAD)**
