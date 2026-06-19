@@ -5,6 +5,7 @@ import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { RapierPhysics } from './lib/RapierPhysics.js';
 import { RapierHelper } from 'three/addons/helpers/RapierHelper.js';
 import Stats from 'three/addons/libs/stats.module.js';
+import { openRoom, generateRoomCode } from './lib/net.js';
 
 let camera, scene, renderer, stats;
 let physics, physicsHelper, controls;
@@ -310,12 +311,20 @@ function applyCarConfig( car, skipVisuals ) {
 
 function cycleCar( direction ) {
 
+    if ( typeof _isCarLocked === 'function' && _isCarLocked() ) {
+
+        if ( typeof showCarToast === 'function' ) showCarToast( 'car locked for race' );
+        return;
+
+    }
+
     currentCarIndex = ( currentCarIndex + direction + CARS.length ) % CARS.length;
     applyCarConfig( CARS[ currentCarIndex ] );
     showCarToast( CARS[ currentCarIndex ].name );
     resetTires();         // fresh tires on each car
     resetDrivetrain();    // engine starts at the new car's idle, clutch closed
     clearSkidMarks();
+    if ( typeof _broadcastLocalMeta === 'function' ) _broadcastLocalMeta();
 
 }
 
@@ -997,7 +1006,7 @@ function initMinimap() {
     // matches the other overlay styling.
     const wrap = document.createElement( 'div' );
     wrap.style.cssText = [
-        'position:absolute', 'bottom:82px', 'left:10px',
+        'position:absolute', 'bottom:200px', 'left:10px',
         'width:200px', 'height:200px',
         'background:rgba(0,0,0,0.55)', 'border:1px solid rgba(255,255,255,0.22)',
         'border-radius:8px', 'overflow:hidden', 'z-index:3',
@@ -1530,6 +1539,7 @@ function completeLap() {
     lapTimer.startTime = performance.now();
     lapTimer.elapsed = 0;
     _resetLapAccumulators();
+    _onLocalLapCompleteForRace();
 
 }
 
@@ -1543,6 +1553,1087 @@ function lapTimerResetCurrent() {
     lapTimer.startTime = 0;
     _resetLapAccumulators();
     if ( lapTimer.timeEl ) lapTimer.timeEl.textContent = '0:00.00';
+
+}
+
+// ---------------- multiplayer ----------------
+//
+// Peer-to-peer via Trystero/nostr. No backend; works on GitHub Pages.
+// Each peer owns its own physics; we broadcast position/rotation/velocity
+// every ~50ms. Remote peers are rendered as translucent ghost cars —
+// they pass through your chassis (no shared physics).
+//
+// UI lives bottom-left, above the lap pill. Two buttons by default:
+//   [ make room ]  [ join room ]
+// "make room" generates a 5-char code and shows it + waiting count.
+// "join room" reveals an inline input. Anyone with the code joins.
+//
+// Race lifecycle:
+//   lobby     — players in the room, no clock running
+//   countdown — anyone clicks "start race"; 3-2-1 then everyone races
+//   racing    — lap timer + finish-line detection are already armed
+//   finished  — first peer to broadcast { type: 'finished' } wins
+// Winner is announced via the existing car-toast plumbing.
+
+const SNAP_INTERVAL_MS = 50;        // 20 Hz position broadcasts
+const INTERP_DELAY_MS = 100;        // render remote cars 100ms in the past
+const SPAWN_SLOT_OFFSET_M = 3;      // metres between adjacent spawn slots
+const COUNTDOWN_MS = 3000;          // pre-race countdown
+const MAX_BUFFERED_SNAPS = 30;
+
+const multiplayer = {
+    room: null,
+    isHost: false,
+    joinTime: 0,
+    playerName: '',
+    raceState: 'lobby',    // 'lobby' | 'ready_check' | 'countdown' | 'racing' | 'finished'
+    raceStartAt: 0,        // ms (Date.now()) when racing actually begins
+    raceWinner: null,      // peerId or 'self'
+    raceWinnerName: '',
+    remotes: new Map(),    // peerId -> RemoteCar
+    metaByPeer: new Map(), // peerId -> { name, carIdx }
+    readyMap: new Map(),   // peerId or 'self' -> { ready, carIdx }
+    localReady: false,
+    lastSnapAt: 0,
+    // UI
+    rootEl: null,
+    primaryRow: null,
+    joinForm: null,
+    roomPanel: null,
+    countdownEl: null
+};
+
+function _isCarLocked() {
+
+    if ( ! multiplayer.room ) return false;
+    const s = multiplayer.raceState;
+    if ( s === 'countdown' || s === 'racing' ) return true;
+    if ( s === 'ready_check' && multiplayer.localReady ) return true;
+    return false;
+
+}
+
+function _localPlayerName() {
+
+    let n = localStorage.getItem( 'playerName' );
+    if ( ! n ) {
+
+        n = 'P' + Math.floor( Math.random() * 9000 + 1000 );
+        try { localStorage.setItem( 'playerName', n ); } catch {}
+
+    }
+    return n;
+
+}
+
+// Room codes are 5 chars of CODE_CHARS — the same charset net.js uses.
+// We tolerate any case in the URL but uppercase when used.
+const _ROOM_CODE_RE = /^[A-HJ-NP-Z2-9]{5}$/i;
+
+// Look in the URL for a room code in this order: last path segment, then
+// ?room=, then #. Returns the code (upper-cased) or null. This lets a
+// share link like https://host/path/AB12X auto-join the room AB12X.
+function _parseAutoJoinCode() {
+
+    const segs = location.pathname.split( '/' ).filter( Boolean );
+    const last = segs[ segs.length - 1 ];
+    if ( last && _ROOM_CODE_RE.test( last ) ) return last.toUpperCase();
+
+    const q = new URLSearchParams( location.search ).get( 'room' );
+    if ( q && _ROOM_CODE_RE.test( q ) ) return q.toUpperCase();
+
+    const h = location.hash.replace( /^#/, '' );
+    if ( h && _ROOM_CODE_RE.test( h ) ) return h.toUpperCase();
+
+    return null;
+
+}
+
+// Build the share URL for a room code by replacing the last path segment
+// of the current location with the code. Examples:
+//   /            + AB12X  ->  /AB12X
+//   /foo/        + AB12X  ->  /foo/AB12X
+//   /foo/AB12X   + 99WWW  ->  /foo/99WWW   (existing code swapped)
+function _shareUrl( code ) {
+
+    let base = location.origin + location.pathname;
+    // Strip trailing slash, then strip any trailing existing code, then add /code
+    base = base.replace( /\/+$/, '' );
+    base = base.replace( /\/[A-HJ-NP-Z2-9]{5}$/i, '' );
+    return base + '/' + code;
+
+}
+
+// Push the room code into the URL bar so refresh / share / copy works.
+// null clears it back to the base path.
+function _setUrlForRoom( code ) {
+
+    let path = location.pathname.replace( /\/+$/, '' ).replace( /\/[A-HJ-NP-Z2-9]{5}$/i, '' );
+    if ( code ) path += '/' + code;
+    if ( path === '' ) path = '/';
+    history.replaceState( null, '', path + location.search + location.hash );
+
+}
+
+// Try to auto-join the URL's room code, but only once the chassis and the
+// multiplayer UI exist (initMultiplayer runs BEFORE initPhysics). Poll for
+// ~2s before giving up.
+function _tryAutoJoinFromUrl() {
+
+    const code = _parseAutoJoinCode();
+    if ( ! code ) return;
+
+    let tries = 0;
+    const attempt = () => {
+
+        tries ++;
+        if ( chassis && multiplayer.rootEl && ! multiplayer.room ) {
+
+            _joinRoom( code );
+            return;
+
+        }
+        if ( tries < 30 && ! multiplayer.room ) setTimeout( attempt, 100 );
+
+    };
+    attempt();
+
+}
+
+// Build a recognisable ghost-car visual without dragging in the physics
+// pipeline. Box body sized like the chassis collider + 4 cylinder wheels
+// + a name sprite floating overhead. Coloured by the remote's chosen car.
+class RemoteCar {
+
+    constructor( peerId, meta ) {
+
+        this.peerId = peerId;
+        this.carIdx = meta && Number.isInteger( meta.carIdx ) ? meta.carIdx : 0;
+        this.name = ( meta && meta.name ) || peerId.slice( 0, 6 );
+        this.snaps = [];                  // [{ time, pos, rot, vel }]
+        this.group = new THREE.Group();
+        this._buildVisual();
+        scene.add( this.group );
+
+    }
+
+    _buildVisual() {
+
+        // Use a hashed-per-peer color, NOT the remote's chosen car color.
+        // Lets you visually tell friends apart at a glance regardless of
+        // which car they actually picked.
+        const color = _colorForPeer( this.peerId );
+
+        const bodyMat = new THREE.MeshLambertMaterial( {
+            color,
+            transparent: true,
+            opacity: 0.6,
+            depthWrite: false
+        } );
+        const body = new THREE.Mesh( new THREE.BoxGeometry( 2, 1, 4 ), bodyMat );
+        body.position.y = 0;
+        this.group.add( body );
+        this.bodyMat = bodyMat;
+
+        // Subtle "roof" so direction is readable at a glance.
+        const roofMat = new THREE.MeshLambertMaterial( {
+            color: 0x111111,
+            transparent: true,
+            opacity: 0.5,
+            depthWrite: false
+        } );
+        const roof = new THREE.Mesh( new THREE.BoxGeometry( 1.6, 0.6, 2 ), roofMat );
+        roof.position.set( 0, 0.7, - 0.2 );
+        this.group.add( roof );
+
+        const wheelMat = new THREE.MeshLambertMaterial( {
+            color: 0x080808,
+            transparent: true,
+            opacity: 0.7,
+            depthWrite: false
+        } );
+        this.wheels = [];
+        const wheelDX = 1.0, wheelDY = - 0.5, wheelDZ = 1.4;
+        const wheelPositions = [
+            [ - wheelDX, wheelDY, - wheelDZ ],
+            [   wheelDX, wheelDY, - wheelDZ ],
+            [ - wheelDX, wheelDY,   wheelDZ ],
+            [   wheelDX, wheelDY,   wheelDZ ]
+        ];
+        for ( const p of wheelPositions ) {
+
+            const w = new THREE.Mesh(
+                new THREE.CylinderGeometry( 0.35, 0.35, 0.35, 16 ),
+                wheelMat
+            );
+            w.rotation.z = Math.PI / 2;
+            w.position.set( p[ 0 ], p[ 1 ], p[ 2 ] );
+            this.group.add( w );
+            this.wheels.push( w );
+
+        }
+
+        this._refreshNameSprite();
+
+        // Hidden until the first snapshot arrives. Without this the group
+        // sits at (0,0,0) — below the Nordschleife terrain — and you see
+        // nothing until the first interpolated frame lands.
+        this.group.visible = false;
+
+    }
+
+    _refreshNameSprite() {
+
+        const carName = ( CARS[ this.carIdx ] || {} ).name || '';
+        const tag = carName ? this.name + ' · ' + carName : this.name;
+        if ( this.nameSprite ) {
+
+            this.group.remove( this.nameSprite );
+            if ( this.nameSprite.material ) {
+
+                if ( this.nameSprite.material.map ) this.nameSprite.material.map.dispose();
+                this.nameSprite.material.dispose();
+
+            }
+
+        }
+        this.nameSprite = _makeNameSprite( tag );
+        this.nameSprite.position.set( 0, 2.4, 0 );
+        this.group.add( this.nameSprite );
+
+    }
+
+    setMeta( meta ) {
+
+        if ( ! meta ) return;
+        // Track carIdx for the ready-list UI but do NOT update the body
+        // color — peer color is fixed per session by _colorForPeer.
+        const prevCarIdx = this.carIdx;
+        const carChanged = Number.isInteger( meta.carIdx ) && meta.carIdx !== prevCarIdx;
+        if ( Number.isInteger( meta.carIdx ) ) this.carIdx = meta.carIdx;
+        const nameChanged = meta.name && meta.name !== this.name;
+        if ( nameChanged ) this.name = meta.name;
+
+        if ( nameChanged || carChanged ) this._refreshNameSprite();
+
+        // Live toast when a peer swaps cars mid-session — skip the very
+        // first meta (no prior car to compare against). Reuses the car-
+        // cycle toast so it looks consistent with your own swaps.
+        if ( carChanged && Number.isInteger( prevCarIdx ) && CARS[ this.carIdx ] ) {
+
+            if ( typeof showCarToast === 'function' ) {
+
+                showCarToast( this.name + ' → ' + CARS[ this.carIdx ].name );
+
+            }
+
+        }
+
+    }
+
+    pushSnap( snap ) {
+
+        const entry = {
+            time: performance.now(),
+            pos: snap.pos,
+            rot: snap.rot,
+            vel: snap.vel || [ 0, 0, 0 ]
+        };
+        this.snaps.push( entry );
+        if ( this.snaps.length > MAX_BUFFERED_SNAPS ) this.snaps.shift();
+        // First snap = peer is now visually placeable on the track.
+        if ( ! this.group.visible ) {
+
+            this._apply( entry );
+            this.group.visible = true;
+
+        }
+
+    }
+
+    // Snapshot interpolation: pick the two snaps straddling renderTime and
+    // lerp/slerp between them. If renderTime is past the latest snap we
+    // hold position (no extrapolation — feels better during lag spikes).
+    update( renderTime, dt ) {
+
+        const n = this.snaps.length;
+        if ( n === 0 ) return;
+        if ( n === 1 ) {
+
+            this._apply( this.snaps[ 0 ], 1 );
+            return;
+
+        }
+
+        let s0 = this.snaps[ 0 ];
+        let s1 = this.snaps[ n - 1 ];
+        for ( let i = 0; i < n - 1; i ++ ) {
+
+            if ( this.snaps[ i ].time <= renderTime && this.snaps[ i + 1 ].time >= renderTime ) {
+
+                s0 = this.snaps[ i ];
+                s1 = this.snaps[ i + 1 ];
+                break;
+
+            }
+
+        }
+
+        const span = s1.time - s0.time;
+        const t = span > 0 ? Math.max( 0, Math.min( 1, ( renderTime - s0.time ) / span ) ) : 0;
+
+        this.group.position.set(
+            s0.pos[ 0 ] + ( s1.pos[ 0 ] - s0.pos[ 0 ] ) * t,
+            s0.pos[ 1 ] + ( s1.pos[ 1 ] - s0.pos[ 1 ] ) * t,
+            s0.pos[ 2 ] + ( s1.pos[ 2 ] - s0.pos[ 2 ] ) * t
+        );
+
+        _qA.set( s0.rot[ 0 ], s0.rot[ 1 ], s0.rot[ 2 ], s0.rot[ 3 ] );
+        _qB.set( s1.rot[ 0 ], s1.rot[ 1 ], s1.rot[ 2 ], s1.rot[ 3 ] );
+        _qA.slerp( _qB, t );
+        this.group.quaternion.copy( _qA );
+
+        // Spin wheels from velocity so they don't look frozen.
+        const v = s1.vel;
+        const speed = Math.sqrt( v[ 0 ] * v[ 0 ] + v[ 2 ] * v[ 2 ] );
+        const angularDelta = ( speed / 0.35 ) * dt;
+        for ( const w of this.wheels ) w.rotation.x -= angularDelta;
+
+    }
+
+    _apply( snap ) {
+
+        this.group.position.set( snap.pos[ 0 ], snap.pos[ 1 ], snap.pos[ 2 ] );
+        this.group.quaternion.set( snap.rot[ 0 ], snap.rot[ 1 ], snap.rot[ 2 ], snap.rot[ 3 ] );
+
+    }
+
+    destroy() {
+
+        scene.remove( this.group );
+        this.group.traverse( ( o ) => {
+
+            if ( o.geometry ) o.geometry.dispose();
+            if ( o.material ) {
+
+                if ( o.material.map ) o.material.map.dispose();
+                o.material.dispose();
+
+            }
+
+        } );
+
+    }
+
+}
+
+const _qA = new THREE.Quaternion();
+const _qB = new THREE.Quaternion();
+
+// Deterministic vivid color per peer. We hash the peerId so the same
+// friend always shows up the same color for you within a session (the
+// color is local to your client, though — they see you with a different
+// random color in their game). HSL with high saturation + medium lightness
+// keeps colors distinguishable against the asphalt and the sky.
+function _colorForPeer( peerId ) {
+
+    let h = 0;
+    for ( let i = 0; i < peerId.length; i ++ ) {
+
+        h = ( ( h << 5 ) - h + peerId.charCodeAt( i ) ) | 0;
+
+    }
+    const hue = ( ( h >>> 0 ) % 360 ) / 360;
+    const c = new THREE.Color();
+    c.setHSL( hue, 0.85, 0.55 );
+    return c.getHex();
+
+}
+
+function _makeNameSprite( name ) {
+
+    const canvas = document.createElement( 'canvas' );
+    canvas.width = 256;
+    canvas.height = 64;
+    const ctx = canvas.getContext( '2d' );
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect( 0, 0, canvas.width, canvas.height );
+    ctx.font = 'bold 32px Monospace';
+    ctx.fillStyle = '#FFCB47';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText( name, canvas.width / 2, canvas.height / 2 );
+    const tex = new THREE.CanvasTexture( canvas );
+    const mat = new THREE.SpriteMaterial( { map: tex, depthTest: false } );
+    const sprite = new THREE.Sprite( mat );
+    sprite.scale.set( 4, 1, 1 );
+    sprite.renderOrder = 999;
+    return sprite;
+
+}
+
+// Spawn slot = where you land when you join a room. Slot 0 stays at
+// spawnPoint (the host); each subsequent slot shifts the local car one
+// car-width to the right (perpendicular to spawn-forward, ground plane).
+function _applySpawnSlot( slot ) {
+
+    if ( ! chassis || slot <= 0 ) return;
+
+    // Right vector = forward rotated 90° clockwise in the XZ plane.
+    const fwdX = _lapFinishForward.x;
+    const fwdZ = _lapFinishForward.z;
+    const rightX = - fwdZ;
+    const rightZ = fwdX;
+
+    const offset = slot * SPAWN_SLOT_OFFSET_M;
+    const x = spawnPoint.x + rightX * offset;
+    const y = spawnPoint.y;
+    const z = spawnPoint.z + rightZ * offset;
+
+    chassis.setTranslation( new physics.RAPIER.Vector3( x, y, z ), true );
+    chassis.setRotation( new physics.RAPIER.Quaternion( spawnQuaternion.x, spawnQuaternion.y, spawnQuaternion.z, spawnQuaternion.w ), true );
+    chassis.setLinvel( new physics.RAPIER.Vector3( 0, 0, 0 ), true );
+    chassis.setAngvel( new physics.RAPIER.Vector3( 0, 0, 0 ), true );
+    chaseCam.initialized = false;
+    input.handbrakeAfterReset = true;
+    lapTimerResetCurrent();
+
+}
+
+function _hookRoomCallbacks( room ) {
+
+    room.on( 'peerJoin', ( peerId ) => {
+
+        // Pre-create a RemoteCar with no visuals-by-meta yet; meta will arrive
+        // moments later and update it. Without this, the first few snaps
+        // would arrive before we have a car to apply them to.
+        if ( ! multiplayer.remotes.has( peerId ) ) {
+
+            multiplayer.remotes.set( peerId, new RemoteCar( peerId, multiplayer.metaByPeer.get( peerId ) ) );
+
+        }
+        _renderMultiplayerUI();
+
+    } );
+
+    room.on( 'peerLeave', ( peerId ) => {
+
+        const rc = multiplayer.remotes.get( peerId );
+        if ( rc ) rc.destroy();
+        multiplayer.remotes.delete( peerId );
+        multiplayer.metaByPeer.delete( peerId );
+        multiplayer.readyMap.delete( peerId );
+        _renderMultiplayerUI();
+        // If their leaving means the remaining players are all ready, kick
+        // off the countdown — otherwise the race stalls forever.
+        _maybeStartCountdown();
+
+    } );
+
+    room.on( 'meta', ( peerId, data ) => {
+
+        multiplayer.metaByPeer.set( peerId, data );
+        let rc = multiplayer.remotes.get( peerId );
+        if ( ! rc ) {
+
+            rc = new RemoteCar( peerId, data );
+            multiplayer.remotes.set( peerId, rc );
+
+        } else {
+
+            rc.setMeta( data );
+
+        }
+        // Map sync: if this peer is authoritative and we're on a different
+        // map, hop to theirs. swapMap() is async; we rebroadcast meta after
+        // it lands so peers know we're now on the right map.
+        if ( _shouldSyncMapTo( data, peerId ) ) {
+
+            const targetMap = data.mapId;
+            swapMap( targetMap ).then( () => { _broadcastLocalMeta(); } );
+            if ( typeof showCarToast === 'function' ) showCarToast( 'joining ' + ( MAPS[ targetMap ]?.label || targetMap ) );
+
+        }
+        _renderMultiplayerUI();
+
+    } );
+
+    room.on( 'snapshot', ( peerId, snap ) => {
+
+        let rc = multiplayer.remotes.get( peerId );
+        if ( ! rc ) {
+
+            // Snapshot arrived before meta (race condition between actions
+            // and the meta sent on peerJoin). Spawn with cached meta if any,
+            // otherwise placeholder until meta lands.
+            rc = new RemoteCar( peerId, multiplayer.metaByPeer.get( peerId ) );
+            multiplayer.remotes.set( peerId, rc );
+            _renderMultiplayerUI();
+
+        }
+        rc.pushSnap( snap );
+
+    } );
+
+    room.on( 'race', ( peerId, evt ) => {
+
+        if ( ! evt || ! evt.type ) return;
+
+        if ( evt.type === 'start_race' ) {
+
+            // Anyone in the room can press "start race"; everyone enters
+            // ready-check together.
+            _enterReadyCheck();
+
+        } else if ( evt.type === 'ready' ) {
+
+            multiplayer.readyMap.set( peerId, { ready: true, carIdx: evt.carIdx } );
+            _renderMultiplayerUI();
+            _maybeStartCountdown();
+
+        } else if ( evt.type === 'countdown' ) {
+
+            // Only the first countdown event wins; later ones are ignored.
+            if ( multiplayer.raceState === 'countdown' || multiplayer.raceState === 'racing' ) return;
+            _enterCountdown( evt.startAt );
+
+        } else if ( evt.type === 'finished' ) {
+
+            if ( ! multiplayer.raceWinner ) {
+
+                multiplayer.raceWinner = peerId;
+                multiplayer.raceWinnerName = ( multiplayer.metaByPeer.get( peerId ) || {} ).name || peerId.slice( 0, 6 );
+                multiplayer.raceState = 'finished';
+                _announceWinner( multiplayer.raceWinnerName + ' wins!' );
+                _renderMultiplayerUI();
+
+            }
+
+        }
+
+    } );
+
+}
+
+function _enterReadyCheck() {
+
+    multiplayer.raceState = 'ready_check';
+    multiplayer.readyMap = new Map();
+    multiplayer.localReady = false;
+    multiplayer.raceWinner = null;
+    multiplayer.raceWinnerName = '';
+    lapTimerResetCurrent();
+    _renderMultiplayerUI();
+
+}
+
+function _toggleReady() {
+
+    if ( ! multiplayer.room ) return;
+    if ( multiplayer.raceState !== 'ready_check' ) return;
+    if ( multiplayer.localReady ) return; // no un-ready in v1
+
+    const carIdx = typeof currentCarIndex === 'number' ? currentCarIndex : 0;
+    multiplayer.localReady = true;
+    multiplayer.readyMap.set( 'self', { ready: true, carIdx } );
+    multiplayer.room.sendRace( { type: 'ready', carIdx } );
+    _renderMultiplayerUI();
+    _maybeStartCountdown();
+
+}
+
+// Local decision: if every peer in the room (and us) has sent a ready
+// event, broadcast the countdown. Duplicates are debounced inside the
+// 'countdown' race handler so multiple clients triggering this in the
+// same tick is harmless.
+function _maybeStartCountdown() {
+
+    if ( ! multiplayer.room ) return;
+    if ( multiplayer.raceState !== 'ready_check' ) return;
+    if ( ! multiplayer.localReady ) return;
+
+    const peers = multiplayer.room.peers();
+    if ( peers.length < 1 ) return; // need at least one opponent
+
+    for ( const p of peers ) {
+
+        const r = multiplayer.readyMap.get( p );
+        if ( ! r || ! r.ready ) return;
+
+    }
+
+    const startAt = Date.now() + COUNTDOWN_MS;
+    multiplayer.room.sendRace( { type: 'countdown', startAt } );
+    _enterCountdown( startAt );
+
+}
+
+function _enterCountdown( startAt ) {
+
+    multiplayer.raceState = 'countdown';
+    multiplayer.raceStartAt = startAt;
+    multiplayer.raceWinner = null;
+    multiplayer.raceWinnerName = '';
+    lapTimerResetCurrent();
+    _renderMultiplayerUI();
+
+}
+
+function _tickRace() {
+
+    if ( multiplayer.raceState === 'countdown' ) {
+
+        const remaining = multiplayer.raceStartAt - Date.now();
+        if ( multiplayer.countdownEl ) {
+
+            if ( remaining <= 0 ) multiplayer.countdownEl.textContent = 'GO!';
+            else multiplayer.countdownEl.textContent = String( Math.ceil( remaining / 1000 ) );
+
+        }
+        if ( remaining <= 0 ) {
+
+            multiplayer.raceState = 'racing';
+            lapTimerResetCurrent();
+            _renderMultiplayerUI();
+
+        }
+
+    }
+
+}
+
+function _announceWinner( msg ) {
+
+    // Reuse the existing car-toast: just write into it.
+    if ( typeof showCarToast === 'function' ) showCarToast( msg );
+    else console.log( '[race]', msg );
+
+}
+
+// Called by completeLap() when the player crosses the finish line. If
+// we're mid-race, broadcast the finish so peers know we won (or we know
+// we beat them to it).
+function _onLocalLapCompleteForRace() {
+
+    if ( ! multiplayer.room ) return;
+    if ( multiplayer.raceState !== 'racing' || multiplayer.raceWinner ) return;
+    multiplayer.raceWinner = 'self';
+    multiplayer.raceWinnerName = multiplayer.playerName + ' (you)';
+    multiplayer.raceState = 'finished';
+    multiplayer.room.sendRace( { type: 'finished' } );
+    _announceWinner( 'you win!' );
+    _renderMultiplayerUI();
+
+}
+
+// 20 Hz position broadcast — runs from animate() after the physics step.
+function _maybeBroadcastSnapshot( now ) {
+
+    if ( ! multiplayer.room || ! chassis ) return;
+    if ( now - multiplayer.lastSnapAt < SNAP_INTERVAL_MS ) return;
+    multiplayer.lastSnapAt = now;
+
+    const p = chassis.translation();
+    const r = chassis.rotation();
+    const v = chassis.linvel();
+    multiplayer.room.sendSnapshot( {
+        pos: [ p.x, p.y, p.z ],
+        rot: [ r.x, r.y, r.z, r.w ],
+        vel: [ v.x, v.y, v.z ]
+    } );
+
+}
+
+function _updateRemoteCars( dt ) {
+
+    if ( multiplayer.remotes.size === 0 ) return;
+    const renderTime = performance.now() - INTERP_DELAY_MS;
+    for ( const rc of multiplayer.remotes.values() ) rc.update( renderTime, dt );
+
+}
+
+// Whenever the player swaps car or starts up, push the meta to peers so
+// their RemoteCar instance for us repaints in the right body colour.
+function _broadcastLocalMeta() {
+
+    if ( ! multiplayer.room ) return;
+    multiplayer.room.meta = {
+        name: multiplayer.playerName,
+        carIdx: typeof currentCarIndex === 'number' ? currentCarIndex : 0,
+        mapId: currentMapId,
+        isHost: multiplayer.isHost,
+        joinTime: multiplayer.joinTime
+    };
+    multiplayer.room.sendMeta();
+
+}
+
+// Decide whether to adopt a peer's map. The host is authoritative — they
+// never adopt. Non-hosts adopt from any host; if no peer is a host (e.g.
+// two URL-joiners), the earlier joiner wins. Local clocks can skew across
+// machines but joinTime drifts by network latency at most a few ms in
+// practice; we tie-break by peerId so the rule is at least deterministic.
+function _shouldSyncMapTo( theirMeta, theirPeerId ) {
+
+    if ( ! theirMeta || ! theirMeta.mapId ) return false;
+    if ( ! MAPS[ theirMeta.mapId ] ) return false;
+    if ( theirMeta.mapId === currentMapId ) return false;
+
+    if ( multiplayer.isHost ) return false;
+    if ( theirMeta.isHost ) return true;
+
+    const theirTime = Number.isFinite( theirMeta.joinTime ) ? theirMeta.joinTime : Infinity;
+    if ( theirTime < multiplayer.joinTime ) return true;
+    if ( theirTime > multiplayer.joinTime ) return false;
+    return theirPeerId < ( multiplayer.room?.selfId || '' );
+
+}
+
+// ----- UI -----
+
+function initMultiplayer() {
+
+    multiplayer.playerName = _localPlayerName();
+
+    const root = document.createElement( 'div' );
+    root.style.cssText = [
+        'position:absolute', 'bottom:82px', 'left:10px',
+        'z-index:5', 'font:12px Monospace', 'color:#fff',
+        'user-select:none', 'min-width:200px',
+        'pointer-events:auto'
+    ].join( ';' );
+    document.body.appendChild( root );
+    multiplayer.rootEl = root;
+
+    _renderMultiplayerUI();
+    _tryAutoJoinFromUrl();
+
+}
+
+function _btnStyle() {
+
+    return [
+        'cursor:pointer', 'padding:4px 10px',
+        'background:rgba(0,0,0,0.55)', 'border:none',
+        'border-radius:4px', 'color:#fff',
+        'font:12px Monospace'
+    ].join( ';' );
+
+}
+
+function _renderMultiplayerUI() {
+
+    if ( ! multiplayer.rootEl ) return;
+    const root = multiplayer.rootEl;
+    root.innerHTML = '';
+
+    if ( ! multiplayer.room ) {
+
+        // Default state — two buttons side by side.
+        const row = document.createElement( 'div' );
+        row.style.cssText = 'display:flex;gap:6px;align-items:center';
+
+        const makeBtn = document.createElement( 'button' );
+        makeBtn.textContent = 'make room';
+        makeBtn.style.cssText = _btnStyle();
+        makeBtn.addEventListener( 'click', () => _createRoom() );
+
+        const joinBtn = document.createElement( 'button' );
+        joinBtn.textContent = 'join room';
+        joinBtn.style.cssText = _btnStyle();
+        joinBtn.addEventListener( 'click', () => _showJoinForm() );
+
+        row.append( makeBtn, joinBtn );
+        root.append( row );
+
+        if ( multiplayer.joinForm ) {
+
+            root.append( multiplayer.joinForm );
+
+        }
+        return;
+
+    }
+
+    // In a room: panel with code, peer count, race controls.
+    const panel = document.createElement( 'div' );
+    panel.style.cssText = [
+        'padding:6px 10px', 'background:rgba(0,0,0,0.7)',
+        'border:1px solid rgba(255,255,255,0.15)',
+        'border-radius:4px', 'display:flex',
+        'flex-direction:column', 'gap:4px'
+    ].join( ';' );
+
+    const header = document.createElement( 'div' );
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px';
+
+    const codeWrap = document.createElement( 'div' );
+    const codeLabel = document.createElement( 'span' );
+    codeLabel.textContent = 'room ';
+    codeLabel.style.opacity = '0.6';
+    const code = document.createElement( 'span' );
+    code.textContent = multiplayer.room.roomCode;
+    code.style.cssText = 'color:#FFCB47;font-weight:bold;letter-spacing:1px';
+    codeWrap.append( codeLabel, code );
+
+    const copyBtn = document.createElement( 'span' );
+    copyBtn.textContent = 'copy link';
+    copyBtn.title = _shareUrl( multiplayer.room.roomCode );
+    copyBtn.style.cssText = 'cursor:pointer;opacity:0.65;font-size:10px';
+    copyBtn.addEventListener( 'mouseenter', () => { copyBtn.style.opacity = '1'; } );
+    copyBtn.addEventListener( 'mouseleave', () => { copyBtn.style.opacity = '0.65'; } );
+    copyBtn.addEventListener( 'click', () => {
+
+        const url = _shareUrl( multiplayer.room.roomCode );
+        navigator.clipboard?.writeText( url ).then( () => {
+
+            copyBtn.textContent = 'copied';
+            setTimeout( () => { copyBtn.textContent = 'copy link'; }, 1100 );
+
+        } );
+
+    } );
+
+    const leaveBtn = document.createElement( 'span' );
+    leaveBtn.textContent = 'leave';
+    leaveBtn.style.cssText = 'cursor:pointer;opacity:0.65;font-size:10px';
+    leaveBtn.addEventListener( 'mouseenter', () => { leaveBtn.style.opacity = '1'; } );
+    leaveBtn.addEventListener( 'mouseleave', () => { leaveBtn.style.opacity = '0.65'; } );
+    leaveBtn.addEventListener( 'click', () => _leaveRoom() );
+
+    header.append( codeWrap, copyBtn, leaveBtn );
+    panel.append( header );
+
+    const urlLine = document.createElement( 'div' );
+    urlLine.textContent = _shareUrl( multiplayer.room.roomCode );
+    urlLine.style.cssText = [
+        'font-size:10px', 'opacity:0.55', 'user-select:all',
+        'cursor:text', 'overflow:hidden', 'text-overflow:ellipsis',
+        'white-space:nowrap', 'max-width:240px'
+    ].join( ';' );
+    panel.append( urlLine );
+
+    const peers = multiplayer.room.peers();
+    const status = document.createElement( 'div' );
+    status.style.cssText = 'font-size:11px;opacity:0.85';
+    if ( multiplayer.raceState === 'lobby' ) {
+
+        status.textContent = `players: ${ peers.length + 1 }${ peers.length === 0 ? ' · waiting for friends...' : '' }`;
+
+    } else if ( multiplayer.raceState === 'ready_check' ) {
+
+        let readyCount = multiplayer.localReady ? 1 : 0;
+        for ( const p of peers ) if ( multiplayer.readyMap.get( p )?.ready ) readyCount ++;
+        const total = peers.length + 1;
+        status.textContent = `${ readyCount }/${ total } ready · pick your car (Q), then press READY`;
+
+    } else if ( multiplayer.raceState === 'countdown' ) {
+
+        status.textContent = 'starting in ';
+        const ce = document.createElement( 'span' );
+        ce.style.cssText = 'color:#FFCB47;font-weight:bold';
+        ce.textContent = String( Math.ceil( ( multiplayer.raceStartAt - Date.now() ) / 1000 ) );
+        status.appendChild( ce );
+        multiplayer.countdownEl = ce;
+
+    } else if ( multiplayer.raceState === 'racing' ) {
+
+        status.innerHTML = `<span style="color:#5DD68F">● racing</span> · ${ peers.length + 1 } players`;
+
+    } else if ( multiplayer.raceState === 'finished' ) {
+
+        status.innerHTML = `<span style="color:#FFCB47">★ ${ multiplayer.raceWinnerName } wins</span>`;
+
+    }
+    panel.append( status );
+
+    // Ready list during ready_check — one row per player with their pick.
+    if ( multiplayer.raceState === 'ready_check' ) {
+
+        const list = document.createElement( 'div' );
+        list.style.cssText = 'font-size:11px;display:flex;flex-direction:column;gap:2px;margin-top:2px;padding-top:4px;border-top:1px solid rgba(255,255,255,0.12)';
+        list.append( _readyRow( 'you', multiplayer.readyMap.get( 'self' ) ) );
+        for ( const p of peers ) {
+
+            const meta = multiplayer.metaByPeer.get( p );
+            const name = ( meta && meta.name ) || p.slice( 0, 6 );
+            list.append( _readyRow( name, multiplayer.readyMap.get( p ) ) );
+
+        }
+        panel.append( list );
+
+    }
+
+    // Race controls.
+    const controls = document.createElement( 'div' );
+    controls.style.cssText = 'display:flex;gap:6px';
+
+    if ( multiplayer.raceState === 'lobby' || multiplayer.raceState === 'finished' ) {
+
+        const startBtn = document.createElement( 'button' );
+        startBtn.textContent = multiplayer.raceState === 'finished' ? 'race again' : 'start race';
+        startBtn.style.cssText = _btnStyle();
+        startBtn.addEventListener( 'click', () => _startRace() );
+        controls.append( startBtn );
+
+    } else if ( multiplayer.raceState === 'ready_check' && ! multiplayer.localReady ) {
+
+        const readyBtn = document.createElement( 'button' );
+        readyBtn.textContent = 'READY';
+        readyBtn.style.cssText = _btnStyle() + ';background:#5DD68F;color:#0c0c0c;font-weight:bold';
+        readyBtn.addEventListener( 'click', () => _toggleReady() );
+        controls.append( readyBtn );
+
+    }
+
+    if ( controls.children.length > 0 ) panel.append( controls );
+
+    root.append( panel );
+
+}
+
+function _readyRow( name, entry ) {
+
+    const row = document.createElement( 'div' );
+    row.style.cssText = 'display:flex;justify-content:space-between;gap:8px';
+    const left = document.createElement( 'span' );
+    left.textContent = name;
+    left.style.opacity = '0.85';
+    const right = document.createElement( 'span' );
+    if ( entry && entry.ready ) {
+
+        const carName = ( CARS[ entry.carIdx ] || {} ).name || '?';
+        right.innerHTML = `<span style="color:#5DD68F">✓</span> <span style="opacity:0.7">${ carName }</span>`;
+
+    } else {
+
+        right.textContent = 'choosing...';
+        right.style.opacity = '0.5';
+
+    }
+    row.append( left, right );
+    return row;
+
+}
+
+function _showJoinForm() {
+
+    const form = document.createElement( 'div' );
+    form.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:6px';
+
+    const input = document.createElement( 'input' );
+    input.type = 'text';
+    input.placeholder = 'room code';
+    input.maxLength = 5;
+    input.style.cssText = [
+        'padding:4px 8px', 'background:rgba(0,0,0,0.55)',
+        'border:1px solid rgba(255,255,255,0.2)', 'color:#fff',
+        'border-radius:4px', 'font:12px Monospace',
+        'width:90px', 'text-transform:uppercase', 'letter-spacing:1px'
+    ].join( ';' );
+
+    const goBtn = document.createElement( 'button' );
+    goBtn.textContent = 'join';
+    goBtn.style.cssText = _btnStyle();
+
+    const submit = () => {
+
+        const code = input.value.trim().toUpperCase();
+        if ( code.length < 3 ) return;
+        _joinRoom( code );
+
+    };
+    goBtn.addEventListener( 'click', submit );
+    input.addEventListener( 'keydown', ( e ) => {
+
+        e.stopPropagation(); // don't let the driving keybinds eat the typing
+        if ( e.key === 'Enter' ) submit();
+
+    } );
+    input.addEventListener( 'keyup', ( e ) => { e.stopPropagation(); } );
+
+    form.append( input, goBtn );
+    multiplayer.joinForm = form;
+    _renderMultiplayerUI();
+    setTimeout( () => input.focus(), 0 );
+
+}
+
+function _createRoom() {
+
+    const code = generateRoomCode();
+    _enterRoom( code, true );
+
+}
+
+function _joinRoom( code ) {
+
+    _enterRoom( code, false );
+
+}
+
+function _enterRoom( code, isHost ) {
+
+    if ( multiplayer.room ) return;
+    multiplayer.isHost = isHost;
+    multiplayer.joinForm = null;
+
+    multiplayer.joinTime = Date.now();
+    const room = openRoom( code, {
+        name: multiplayer.playerName,
+        carIdx: typeof currentCarIndex === 'number' ? currentCarIndex : 0,
+        mapId: currentMapId,
+        isHost,
+        joinTime: multiplayer.joinTime
+    } );
+    multiplayer.room = room;
+    _hookRoomCallbacks( room );
+    _setUrlForRoom( code );
+
+    // Joining? Wait a tick so peer-count is meaningful, then take a slot
+    // beside the existing players. Hosts always stay in slot 0.
+    if ( ! isHost ) {
+
+        setTimeout( () => {
+
+            const peerCount = room.peers().length;
+            _applySpawnSlot( peerCount );
+
+        }, 300 );
+
+    }
+
+    _renderMultiplayerUI();
+
+}
+
+function _leaveRoom() {
+
+    if ( multiplayer.room ) {
+
+        try { multiplayer.room.leave(); } catch {}
+        multiplayer.room = null;
+
+    }
+    for ( const rc of multiplayer.remotes.values() ) rc.destroy();
+    multiplayer.remotes.clear();
+    multiplayer.metaByPeer.clear();
+    multiplayer.readyMap = new Map();
+    multiplayer.localReady = false;
+    multiplayer.raceState = 'lobby';
+    multiplayer.raceWinner = null;
+    multiplayer.raceWinnerName = '';
+    multiplayer.isHost = false;
+    _setUrlForRoom( null );
+    _renderMultiplayerUI();
+
+}
+
+function _startRace() {
+
+    if ( ! multiplayer.room ) return;
+    multiplayer.room.sendRace( { type: 'start_race' } );
+    _enterReadyCheck();
 
 }
 
@@ -1922,7 +3013,12 @@ const input = {
     keyR: false, keySpace: false,
     // S-held timer for long-press reverse engagement
     sHeldTime: 0,
-    reverseEngaged: false
+    reverseEngaged: false,
+    // Initial-spawn / post-R-reset handbrake lock — gravity can roll the
+    // chassis on inclined spawns and we don't want the car drifting before
+    // the player has even touched a key. Released by updateInput() the
+    // first frame _anyInputActive() returns true.
+    handbrakeAfterReset: true
 };
 
 // Transmission state. Gear: -1 = R, 0 = N, 1..5 = forward gears.
@@ -2295,6 +3391,7 @@ async function init() {
     initCarToast();
     initMinimap();
     initLapTimer();
+    initMultiplayer();
     initSkidMarks();
     initVolumeSlider();
     renderControlsCheatsheet();
@@ -2768,6 +3865,9 @@ async function swapMap( id ) {
     // Swap the lap-history bucket — each map has its own best times.
     if ( lapTimer ) { _lapTimerLoadForMap(); _lapTimerRefreshPanel(); }
 
+    // Tell peers we moved (and pull them along if we're authoritative).
+    if ( typeof _broadcastLocalMeta === 'function' && multiplayer.room ) _broadcastLocalMeta();
+
     // 5) Load the new track geometry + collider mesh.
     await loadTrack();
 
@@ -2785,6 +3885,7 @@ async function swapMap( id ) {
         engine.rpm = engine.idleRpm;
         input.reverseEngaged = false;
         input.sHeldTime = 0;
+        input.handbrakeAfterReset = true;
         chaseCam.initialized = false;
         resetTires();
         resetDrivetrain();
@@ -4050,6 +5151,16 @@ function updateInput( dt ) {
     input.handbrake = handbrake;
     input.reset = input.keyR;
 
+    // Post-R handbrake lock — set by the reset block in applyVehicleForces.
+    // Released the moment the player actually inputs anything (key, gamepad,
+    // or touch). Until then we force handbrake = 1 so the chassis can't roll.
+    if ( input.handbrakeAfterReset ) {
+
+        if ( _anyInputActive() ) input.handbrakeAfterReset = false;
+        else input.handbrake = 1;
+
+    }
+
     // Long-press reverse: S / ↓ / touch brake bar trigger this — Space is a
     // pure brake and never engages reverse. Requires car essentially stopped.
     const speed = vehicleController ? Math.abs( vehicleController.currentVehicleSpeed() ) : 0;
@@ -4192,6 +5303,7 @@ function applyVehicleForces( speed, dt ) {
         engine.rpm = engine.idleRpm;
         input.reverseEngaged = false;
         input.sHeldTime = 0;
+        input.handbrakeAfterReset = true;
         chaseCam.initialized = false;
         resetTires();
         resetDrivetrain();
@@ -4430,7 +5542,12 @@ function animate( time ) {
 
         updateLapTimer();
 
+        _maybeBroadcastSnapshot( performance.now() );
+
     }
+
+    _updateRemoteCars( delta );
+    _tickRace();
 
     if ( cameraMode === 'chase' ) {
 

@@ -2,7 +2,7 @@
 
 ## Latest Commit
 
-- Add the missing ledger bullet for the prior cleanup commit **(HEAD)**
+- Add P2P multiplayer with ghost cars + race-to-first-lap (Trystero/nostr, no backend; shareable /CODE URL + GH-Pages SPA fallback for auto-join; ready-check with locked car selection; 1-2-3 countdown; host-wins map sync; per-peer random colors; live name + car tag updates on switch; spawn-slot offset so friends never land on you; initial-spawn handbrake held until first input) **(HEAD)**
 
 ## all commits
 
@@ -29,4 +29,5 @@
 - Format README ledger as proper markdown (h2 sections + bullet list) [(d5f5d8a)](https://github.com/Eeman1113/race_in_progress/commit/d5f5d8a)
 - Swap controls cheatsheet to gamepad bindings when a controller is connected (LS/RT/LT/A/X/Y/Back/Start/bumpers/dpad listed; keyboard scheme restored on disconnect) [(be95de2)](https://github.com/Eeman1113/race_in_progress/commit/be95de2)
 - Drop the backfill bullet from the ledger [(6db0a34)](https://github.com/Eeman1113/race_in_progress/commit/6db0a34)
-- Add the missing ledger bullet for the prior cleanup commit **(HEAD)**
+- Add the missing ledger bullet for the prior cleanup commit [(4abe7ba)](https://github.com/Eeman1113/race_in_progress/commit/4abe7ba)
+- Add P2P multiplayer with ghost cars + race-to-first-lap (Trystero/nostr, no backend; shareable /CODE URL + GH-Pages SPA fallback for auto-join; ready-check with locked car selection; 1-2-3 countdown; host-wins map sync; per-peer random colors; live name + car tag updates on switch; spawn-slot offset so friends never land on you; initial-spawn handbrake held until first input) **(HEAD)**

@@ -167,6 +167,22 @@
             <div id="controlsList"></div>
         </div>
 
+        <script>
+          // Restore real path after the 404.html SPA redirect on GH Pages.
+          // If we got here via /?/AB12X (404.html rewrote it), put the
+          // pathname back to /AB12X so the auto-join code finds it.
+          (function(l) {
+            if (l.search[1] === '/') {
+              var decoded = l.search.slice(1).split('&').map(function(s) {
+                return s.replace(/~and~/g, '&');
+              }).join('?');
+              window.history.replaceState(
+                null, null,
+                l.pathname.slice(0, -1) + decoded + l.hash
+              );
+            }
+          })(window.location);
+        </script>
         <script type="module" src="/src/main.js"></script>
     </body>
 </html>
