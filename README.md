@@ -2,7 +2,7 @@
 
 ## Latest Commit
 
-- Add lap timer with persistent history and finish-line detection (bottom-left pill with drop-up of past laps + average; arms only on real input; multi-gate anti-cheese on spawn-point crossings) **(HEAD)**
+- Backfill README ledger with the lap-timer + format-change commits (catches the ledger up to HEAD) **(HEAD)**
 
 ## all commits
 
@@ -25,4 +25,6 @@
 - Add Nürburgring GP layout as second map (press 2 / dpad right, 1 to return) `(35ed254)`
 - Drop center of mass + full inertia tensor (kills wheelie / pitch-up under acceleration) `(c042535)`
 - Retune Nürburgring GP spawn pose (lands on asphalt at the new 2× scale) `(f7ea679)`
-- Add lap timer with persistent history and finish-line detection (bottom-left pill with drop-up of past laps + average; arms only on real input; multi-gate anti-cheese on spawn-point crossings) **(HEAD)**
+- Add lap timer with persistent history and finish-line detection (bottom-left pill with drop-up of past laps + average; arms only on real input; multi-gate anti-cheese on spawn-point crossings) `(c4ba794)`
+- Format README ledger as proper markdown (h2 sections + bullet list) `(d5f5d8a)`
+- Backfill README ledger with the lap-timer + format-change commits (catches the ledger up to HEAD) **(HEAD)**
