@@ -2,7 +2,7 @@
 
 ## Latest Commit
 
-- Map 4 (Suzuka) spawn re-captured again to `(505.02, -5.37, 504.37)` / rot `(0.0026, -0.9995, -0.0158, 0.0257)` — corrects the previous pose. **(HEAD)**
+- Suzuka foliage fix — two-in-one: (a) the baked `alphaCutoff: 0.08` on the 12 `TREE0*` / `SHRUB_*` cutout billboards left the rectangular card silhouettes faintly visible (looked like "transparent glass panes" sticking out of the trees); raised `alphaTest` to 0.4 at runtime in `loadTrack` so only the actual leaf pixels render. (b) the static trimesh collider builder was iterating EVERY mesh of the track GLB, including those tree cards, so the car was bouncing off invisible rectangles next to the track. New `obj.userData.isFoliage` flag tags any mesh with a `TREE*` / `SHRUB*` material name (except `TREE_SHADOW`, which is a ground-decal BLEND); the trimesh loop now skips those meshes so trees are visual-only. Map 1-3 unaffected since none of their materials match the regex. **(HEAD)**
 
 ## all commits
 
@@ -45,3 +45,4 @@
 - Map 4 (Suzuka) car scale dropped 30 %: `MAPS.suzuka.carScale` 1.35 → 0.945. The 1.35 × scale-up overshot for Suzuka's narrower geometry; this brings the car visual closer to true track-relative scale.
 - Map 4 (Suzuka) spawn re-captured to `(499.42, 0.12, 342.80)` / rot `(0.0167, 0.0052, 0.0001, 0.9998)` — drops the player on the actual main straight pointing straight down the road instead of the prior off-pit-lane pose.
 - Map 4 (Suzuka) spawn re-captured again to `(505.02, -5.37, 504.37)` / rot `(0.0026, -0.9995, -0.0158, 0.0257)` — corrects the previous pose.
+- Suzuka foliage fix — two-in-one: (a) the baked `alphaCutoff: 0.08` on the 12 `TREE0*` / `SHRUB_*` cutout billboards left the rectangular card silhouettes faintly visible (looked like "transparent glass panes" sticking out of the trees); raised `alphaTest` to 0.4 at runtime in `loadTrack` so only the actual leaf pixels render. (b) the static trimesh collider builder was iterating EVERY mesh of the track GLB, including those tree cards, so the car was bouncing off invisible rectangles next to the track. New `obj.userData.isFoliage` flag tags any mesh with a `TREE*` / `SHRUB*` material name (except `TREE_SHADOW`, which is a ground-decal BLEND); the trimesh loop now skips those meshes so trees are visual-only. Map 1-3 unaffected since none of their materials match the regex.

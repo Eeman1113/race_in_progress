@@ -4173,6 +4173,29 @@ async function loadTrack() {
             obj.castShadow = false;
             obj.receiveShadow = true;
 
+            // Foliage flag: the Suzuka GLB has 12 TREE0*/SHRUB_* materials
+            // (alpha-cutout billboards) plus a TREE_SHADOW ground-decal. Tag
+            // their meshes so we can (a) raise the alpha-test cutoff at
+            // runtime to hide the rectangular card silhouette that the baked
+            // 0.08 cutoff was leaving visible, and (b) skip them in the
+            // trimesh collider builder below — currently the car physically
+            // hits invisible tree cards next to the track.
+            const mat = obj.material;
+            const matName = mat && mat.name ? mat.name : '';
+            if ( /^(TREE|SHRUB)/.test( matName ) ) {
+
+                obj.userData.isFoliage = true;
+                // TREE_SHADOW is a flat ground decal (BLEND, low opacity);
+                // only bump alphaTest on the cutout billboards.
+                if ( matName !== 'TREE_SHADOW' && mat.alphaTest != null ) {
+
+                    mat.alphaTest = 0.4;
+                    mat.needsUpdate = true;
+
+                }
+
+            }
+
         }
 
     } );
@@ -4187,6 +4210,9 @@ async function loadTrack() {
     track.traverse( ( obj ) => {
 
         if ( ! obj.isMesh || ! obj.geometry ) return;
+        // Skip foliage billboards — they're alpha-cutout tree cards. Their
+        // bounding quad has no business being a solid wall the car bounces off.
+        if ( obj.userData.isFoliage ) return;
 
         const geom = obj.geometry;
         const posAttr = geom.attributes.position;
