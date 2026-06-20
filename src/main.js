@@ -3314,7 +3314,7 @@ const CARS = [
         suspensionRestLength: 0.42, wheelConnectionY: - 0.30,
         maxBrakeForce: 1.25, handbrakeMultiplier: 1.6, maxSteeringAngle: Math.PI / 4,
         brakeBias: 0.66,
-        camberDeg: [ - 0.5, - 0.5, - 0.3, - 0.3 ], toeDeg: [ 0, 0, 0.1, 0.1 ],
+        camberDeg: [ - 0.5, - 0.5, - 0.3, - 0.3 ], toeDeg: [ 0, 0, 0.1, - 0.1 ],
         engineInertia: 0.14, clutchStiffness: 280, lsdLocking: 0.30,
         Cd: 0.0250, Cl: 0.0000,
         driveType: 'FWD'
@@ -3336,7 +3336,7 @@ const CARS = [
         suspensionRestLength: 0.42, wheelConnectionY: - 0.32,
         maxBrakeForce: 1.5, handbrakeMultiplier: 1.7, maxSteeringAngle: Math.PI / 4.2,
         brakeBias: 0.62,
-        camberDeg: [ - 1, - 1, - 0.5, - 0.5 ], toeDeg: [ 0, 0, 0.1, 0.1 ],
+        camberDeg: [ - 1, - 1, - 0.5, - 0.5 ], toeDeg: [ 0, 0, 0.1, - 0.1 ],
         engineInertia: 0.20, clutchStiffness: 340, lsdLocking: 0.55,
         Cd: 0.0235, Cl: 0.0000,
         driveType: 'RWD'
@@ -3358,7 +3358,7 @@ const CARS = [
         suspensionRestLength: 0.28, wheelConnectionY: - 0.26,
         maxBrakeForce: 2.1, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4,
         brakeBias: 0.54,
-        camberDeg: [ - 2.2, - 2.2, - 1.2, - 1.2 ], toeDeg: [ - 0.1, - 0.1, 0.2, 0.2 ],
+        camberDeg: [ - 2.2, - 2.2, - 1.2, - 1.2 ], toeDeg: [ - 0.1, 0.1, 0.2, - 0.2 ],
         engineInertia: 0.07, clutchStiffness: 600, lsdLocking: 0.75,
         Cd: 0.0128, Cl: 0.0080,
         driveType: 'RWD'
@@ -3380,7 +3380,7 @@ const CARS = [
         suspensionRestLength: 0.48, wheelConnectionY: - 0.34,
         maxBrakeForce: 1.8, handbrakeMultiplier: 2.4, maxSteeringAngle: Math.PI / 3.8,
         brakeBias: 0.58,
-        camberDeg: [ - 1.2, - 1.2, - 1.0, - 1.0 ], toeDeg: [ 0, 0, 0.1, 0.1 ],
+        camberDeg: [ - 1.2, - 1.2, - 1.0, - 1.0 ], toeDeg: [ 0, 0, 0.1, - 0.1 ],
         engineInertia: 0.12, clutchStiffness: 460, lsdLocking: 0.90,
         Cd: 0.0290, Cl: 0.0030,
         driveType: 'AWD'
@@ -3402,7 +3402,7 @@ const CARS = [
         suspensionRestLength: 0.28, wheelConnectionY: - 0.25,
         maxBrakeForce: 2.2, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4,
         brakeBias: 0.57,
-        camberDeg: [ - 1.8, - 1.8, - 1.0, - 1.0 ], toeDeg: [ - 0.1, - 0.1, 0.2, 0.2 ],
+        camberDeg: [ - 1.8, - 1.8, - 1.0, - 1.0 ], toeDeg: [ - 0.1, 0.1, 0.2, - 0.2 ],
         engineInertia: 0.13, clutchStiffness: 620, lsdLocking: 0.80,
         Cd: 0.0182, Cl: 0.0140,
         driveType: 'RWD'
@@ -3430,7 +3430,7 @@ const CARS = [
         suspensionRestLength: 0.22, wheelConnectionY: - 0.22,
         maxBrakeForce: 3.2, handbrakeMultiplier: 1.4, maxSteeringAngle: Math.PI / 5.0,
         brakeBias: 0.62,
-        camberDeg: [ - 2.5, - 2.5, - 1.5, - 1.5 ], toeDeg: [ - 0.1, - 0.1, 0.15, 0.15 ],
+        camberDeg: [ - 2.5, - 2.5, - 1.5, - 1.5 ], toeDeg: [ - 0.1, 0.1, 0.15, - 0.15 ],
         engineInertia: 0.07, clutchStiffness: 800, lsdLocking: 1.00,
         Cd: 0.0190, Cl: 0.0420,
         driveType: 'RWD'
@@ -3452,7 +3452,7 @@ const CARS = [
         suspensionRestLength: 0.28, wheelConnectionY: - 0.25,
         maxBrakeForce: 5.5, handbrakeMultiplier: 2.0, maxSteeringAngle: Math.PI / 4,
         brakeBias: 0.55,
-        camberDeg: [ - 2, - 2, - 1, - 1 ], toeDeg: [ 0, 0, 0.05, 0.05 ],
+        camberDeg: [ - 2, - 2, - 1, - 1 ], toeDeg: [ 0, 0, 0.05, - 0.05 ],
         engineInertia: 0.04, clutchStiffness: 1300, lsdLocking: 1.00,
         Cd: 0.0165, Cl: 0.0700,
         driveType: 'AWD'
@@ -6387,40 +6387,49 @@ function applyVehicleForces( speed, dt ) {
     vehicleController.setWheelBrake( 2, Math.max( w2, handbrake ) );
     vehicleController.setWheelBrake( 3, Math.max( w3, handbrake ) );
 
-    // Straight-line braking lateral assist. On a slope, gravity pulls the
+    // Straight-line lateral-velocity assist. On a slope, gravity pulls the
     // car sideways relative to its heading — the wheels integrate that as
     // chassis-local +X velocity even when the player is going perfectly
     // straight, and the slip angle grows past peak, grip collapses,
     // car slides off into the wall at 15 km/h. This bleeds off that
-    // unintended lateral velocity whenever the player is braking with
-    // centred steering and no handbrake. Falls off above ~10 m/s so the
-    // player can still trail-brake into corners on the flat.
-    if ( input.brake >= 0.05
-        && Math.abs( input.steer ) < 0.02
-        && input.handbrake < 0.05 ) {
+    // unintended lateral velocity whenever the player has centred steering
+    // and no handbrake. Two strengths:
+    //   - hard damp when braking (caught the panic-stop slide on slopes)
+    //   - mild damp when coasting (catches the long-tail crab from any
+    //     residual setup asymmetry — toe, suspension, surface)
+    // Both fade above ~12 m/s so the player can still trail-brake or
+    // four-wheel drift on the flat at speed.
+    if ( Math.abs( input.steer ) < 0.02 && input.handbrake < 0.05 ) {
 
         const v = chassis.linvel();
         const q = chassis.rotation();
         _worldToLocalVec( v, q, _carLocalVel );
         const vLatLocal = _carLocalVel.x;
-        if ( Math.abs( vLatLocal ) > 0.05 ) {
+        if ( Math.abs( vLatLocal ) > 0.03 ) {
 
             const speedAssist = Math.hypot( v.x, v.y, v.z );
-            const speedFactor = speedAssist < 10
+            const speedFactor = speedAssist < 12
                 ? 1
-                : Math.max( 0.25, 1 - ( speedAssist - 10 ) / 30 );
-            const dampRate = 6.0 * input.brake * speedFactor;
-            const k = 1 - Math.exp( - dampRate * dt );
-            // world right-axis = quaternion-rotated (1, 0, 0)
-            const qx = q.x, qy = q.y, qz = q.z, qw = q.w;
-            const rx = 1 - 2 * ( qy * qy + qz * qz );
-            const ry = 2 * ( qx * qy + qw * qz );
-            const rz = 2 * ( qx * qz - qw * qy );
-            const reduction = k * vLatLocal;
-            chassis.setLinvel(
-                { x: v.x - reduction * rx, y: v.y - reduction * ry, z: v.z - reduction * rz },
-                true
-            );
+                : Math.max( 0.15, 1 - ( speedAssist - 12 ) / 28 );
+            // Brake-pressing → strong damp (12 1/s). Coasting → mild (2 1/s).
+            const brakeStrength = 12.0 * input.brake;
+            const coastStrength = input.throttle < 0.05 && input.brake < 0.05 ? 2.0 : 0;
+            const dampRate = ( brakeStrength + coastStrength ) * speedFactor;
+            if ( dampRate > 0 ) {
+
+                const k = 1 - Math.exp( - dampRate * dt );
+                // world right-axis = quaternion-rotated (1, 0, 0)
+                const qx = q.x, qy = q.y, qz = q.z, qw = q.w;
+                const rx = 1 - 2 * ( qy * qy + qz * qz );
+                const ry = 2 * ( qx * qy + qw * qz );
+                const rz = 2 * ( qx * qz - qw * qy );
+                const reduction = k * vLatLocal;
+                chassis.setLinvel(
+                    { x: v.x - reduction * rx, y: v.y - reduction * ry, z: v.z - reduction * rz },
+                    true
+                );
+
+            }
 
         }
 
