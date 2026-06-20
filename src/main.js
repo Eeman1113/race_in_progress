@@ -3664,7 +3664,14 @@ const MAPS = {
         // its baseColorTexture and force a concrete-grey baseColorFactor.
         materialOverrides: {
             'NODE.001': { removeMap: true, color: 0x707276 }
-        }
+        },
+        // Materials whose meshes should be kept VISUAL but skipped from the
+        // trimesh collider. The NODE.001 mesh has a rogue cube on the racing
+        // line that survived the GLB strip pass — we leave it visible (still
+        // grey) but the car drives through it. Grandstand seats elsewhere
+        // also become non-collidable, which is fine — players don't drive
+        // into stands and if they do, clipping is better than a wall.
+        nonCollidableMaterials: [ 'NODE.001' ]
     },
 };
 let currentMapId = 'nurburgring';
@@ -4239,6 +4246,7 @@ async function loadTrack() {
     const excludeList = mapCfg.excludeMeshesNear || [];
     const _excludeCenter = new THREE.Vector3();
     const matOverrides = mapCfg.materialOverrides || {};
+    const nonCollidableMats = new Set( mapCfg.nonCollidableMaterials || [] );
 
     track.traverse( ( obj ) => {
 
@@ -4290,6 +4298,13 @@ async function loadTrack() {
 
             }
 
+            // Per-map non-collidable materials: keep visual, skip collider.
+            if ( matName && nonCollidableMats.has( matName ) ) {
+
+                obj.userData.nonCollidable = true;
+
+            }
+
             // Per-map junk-mesh exclusion: hide + skip-collider any mesh whose
             // centre is within radius of a configured world-space point.
             if ( excludeList.length > 0 && obj.geometry ) {
@@ -4333,6 +4348,9 @@ async function loadTrack() {
         if ( obj.userData.isFoliage ) return;
         // Skip junk meshes excluded by map config.
         if ( obj.userData.excludedJunk ) return;
+        // Skip materials marked non-collidable (debug placeholders, far-away
+        // grandstand seats — visual only).
+        if ( obj.userData.nonCollidable ) return;
 
         const geom = obj.geometry;
         const posAttr = geom.attributes.position;
