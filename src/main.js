@@ -777,10 +777,16 @@ function updateBrakeLights() {
 // Windows over USB and Bluetooth for DualSense / DualShock 4 / Xbox
 // pads. Silently no-ops on Safari and on pads without `vibrationActuator`.
 
+// Master gain headroom. The base magnitudes inside updateRumble +
+// rumblePulse were tuned for a "calm" Art-of-Rally feel; the slider
+// gets multiplied by this so RUM=40 reproduces that old calm baseline
+// and RUM=100 gives ~2.5x stronger feedback for players who want more.
+const RUMBLE_MAX_SCALE = 2.5;
+
 const rumble = {
-    // master scale 0..1. Persisted to localStorage by the RUM slider in
-    // the controls overlay; 0 = off entirely.
-    strength: 1,
+    // master scale 0..1 from the slider. Effective multiplier =
+    // strength * RUMBLE_MAX_SCALE. 0 hard-disables.
+    strength: 0.4,
     // continuous baseline (set every frame from car state)
     contWeak: 0, contStrong: 0,
     // one-shot pulse (decays to 0 when onceEndsAt is in the past)
@@ -828,8 +834,11 @@ function rumbleTick() {
     if ( now < rumble.onceEndsAt ) { oW = rumble.onceWeak; oS = rumble.onceStrong; }
     // Master scale applied here so the slider gain affects both the
     // continuous baseline and any active one-shot pulse uniformly.
-    const weak = Math.max( oW, rumble.contWeak ) * rumble.strength;
-    const strong = Math.max( oS, rumble.contStrong ) * rumble.strength;
+    // RUMBLE_MAX_SCALE gives slider 1.0 enough headroom over the old
+    // calm baseline (which now lives at slider 0.4).
+    const scale = rumble.strength * RUMBLE_MAX_SCALE;
+    const weak = Math.max( oW, rumble.contWeak ) * scale;
+    const strong = Math.max( oS, rumble.contStrong ) * scale;
     if ( weak < 0.01 && strong < 0.01 ) return; // silence — nothing to play
     if ( now - rumble.lastIssued < rumble.reIssueMs ) return;
     rumble.lastIssued = now;
@@ -3171,8 +3180,30 @@ function initRumbleSlider() {
     const infoEl = document.getElementById( 'info' );
     if ( ! infoEl ) return;
 
+    // One-time migration: existing players have a v1 stored value where
+    // slider 1.0 mapped to 1.0x output. The new slider includes a 2.5x
+    // headroom multiplier, so divide their old value by 2.5 to preserve
+    // the same physical sensation. Mark migrated with a flag key.
+    const migrated = localStorage.getItem( 'rumbleSliderV2' ) === '1';
     const saved = parseFloat( localStorage.getItem( 'rumbleStrength' ) );
-    if ( Number.isFinite( saved ) && saved >= 0 && saved <= 1 ) rumble.strength = saved;
+    if ( Number.isFinite( saved ) && saved >= 0 && saved <= 1 ) {
+
+        if ( migrated ) rumble.strength = saved;
+        else {
+
+            rumble.strength = Math.min( 1, saved / RUMBLE_MAX_SCALE );
+            localStorage.setItem( 'rumbleStrength', String( rumble.strength ) );
+            localStorage.setItem( 'rumbleSliderV2', '1' );
+
+        }
+
+    } else {
+
+        // Fresh install — default to 0.4 (= the old "calm" baseline).
+        rumble.strength = 0.4;
+        localStorage.setItem( 'rumbleSliderV2', '1' );
+
+    }
 
     const row = document.createElement( 'div' );
     row.className = 'volume-row';
