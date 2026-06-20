@@ -1266,7 +1266,7 @@ function _dsUpdateButton() {
         // Click in this state calls _dsDetach() — see the click handler
         // in initDualsenseButton. Stays enabled so the player can turn
         // it off without unplugging the controller.
-        _dsButtonEl.textContent = '✓ triggers on  (click to turn off)';
+        _dsButtonEl.textContent = '✓ triggers on';
         _dsButtonEl.style.opacity = '1';
         _dsButtonEl.disabled = false;
         _dsButtonEl.style.display = '';
