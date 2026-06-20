@@ -957,10 +957,21 @@ const ds = {
     },
     // Edge-tracking for the mapper.
     prevTcEngaged: false,
-    tcBumpUntil: 0,
+    tcBumpUntil: 0,           // R2 wheelspin/TC vibration end time (ms)
     prevAbsEngaged: false,
-    absPulseUntil: 0,
-    prevOffTrack: false
+    absPulseUntil: 0,         // L2 ABS pulse hold end time (ms)
+    prevOffTrack: false,
+    // GT7-pass additions:
+    revLimitUntil: 0,         // R2 rev-limiter weapon active until (ms)
+    revLimitCooldownUntil: 0, // earliest time a new rev-limit pulse may fire
+    prevShiftCd: 0,           // last frame's transmission.shiftCooldown
+    shiftTickUntil: 0,        // R2 shift micro-tick active until (ms)
+    kerbHitUntil: 0,          // L2 kerb-impact pulse active until (ms)
+    prevSusp: [ 0, 0, 0, 0 ], // per-wheel suspension force last frame
+    lastR2Mode: 0,            // last R2 mode byte we requested (flicker guard)
+    lastL2Mode: 0,            // last L2 mode byte we requested
+    lastR2ModeAt: 0,          // ms when lastR2Mode was set
+    lastL2ModeAt: 0           // ms when lastL2Mode was set
 };
 
 // Sony's HID filter — covers the DualSense USB IDs we've seen in the wild.
@@ -1453,7 +1464,7 @@ function initDualsenseButton() {
 function updateDualsense( speed ) {
 
     if ( ! ds.device || ds.disabled ) return;
-    // Honour the master "haptics off" slider — RUM=0 → all triggers OFF.
+    // Master "haptics off" — RUM=0 → both triggers fully free, bail early.
     if ( rumble.strength <= 0 ) {
 
         dsTriggerOff( 'L2' );
@@ -1462,88 +1473,170 @@ function updateDualsense( speed ) {
         return;
 
     }
-    // Scale 0..1 so RUM=40 (the default "calm" baseline) maps to ~0.6 of
-    // the max-strength force values below, and RUM=100 reaches full bite
-    // without ever pinning the trigger solid (forces capped at 255 max).
+    // 0..~1.5. Forces below are tuned at scale=1 (RUM≈0.67); the master
+    // slider then biases ±. If scale collapses near zero, we cut to OFF
+    // entirely rather than push sub-perceptual forces.
     const scale = Math.min( 1.5, rumble.strength * 1.5 );
     const now = performance.now();
+    const HOLD_MS = 80;  // anti-flicker mode-hold (Off↔Feedback↔…)
 
-    // ---- R2 (throttle) — Forza-style ------------------------------------
-    // Forza Horizon 5 / Motorsport behaviour we're replicating:
-    //   * Light constant resistance off-throttle so the pedal has weight.
-    //   * Resistance climbs with engine load (≈ RPM × throttle), so
-    //     stabbing the pedal at low RPM feels lighter than holding it
-    //     pinned at redline.
-    //   * On wheelspin (TC engaged), a short vibration burst on R2 —
-    //     "the tyre is slipping, lift!" cue.
-    //   * Rev limiter: Weapon-mode hard wall past redline. This is the
-    //     one cue we ALWAYS deliver at full force, regardless of scale.
+    // -------- gather state --------
     const rpm = engine.rpm || 0;
     const redline = engine.redline || 7500;
-    const idle = engine.idleRpm || 900;
-    const rpmNorm = Math.max( 0, Math.min( 1.2, ( rpm - idle ) / Math.max( 1, redline - idle ) ) );
-    const throttle = Math.max( 0, Math.min( 1, input.throttle || 0 ) );
-    const load = Math.max( rpmNorm * 0.6, rpmNorm * throttle );
-    if ( drivetrain.tc.engaged && ! ds.prevTcEngaged ) ds.tcBumpUntil = now + 220;
-    ds.prevTcEngaged = drivetrain.tc.engaged;
-    const tcBumping = now < ds.tcBumpUntil;
+    const brake = Math.max( 0, Math.min( 1, input.brake || 0 ) );
+    const steerMag = Math.min( 1, Math.abs( input.steer || 0 ) );
 
-    // Event-only: the trigger is FREE by default. Only the two specific
-    // moments that actually matter to a player trip resistance. No more
-    // continuous-cruise resistance — that was causing the trigger to
-    // visibly flicker as RPM bobbed and the per-frame force re-quantised.
-    if ( rpm >= redline * 0.99 ) {
+    // Wheelspin probe — any DRIVEN wheel past peak slip. Falls back to all
+    // four wheels if the car descriptor is missing for any reason.
+    let drivenIdx = [ 0, 1, 2, 3 ];
+    try { drivenIdx = drivenWheelIndices( currentCar && currentCar.driveType ); } catch ( e ) {}
+    let maxDriveSlip = 0;
+    for ( let k = 0; k < drivenIdx.length; k ++ ) {
 
-        // Rev limiter: noticeable wall, force 130. The "shift NOW" cue.
-        dsTriggerWeapon( 'R2', 180, 220, 130 );
-
-    } else if ( tcBumping ) {
-
-        // TC engage burst: short vibration that decays over ~220 ms.
-        dsTriggerVibration( 'R2', 30, 12, Math.round( 90 * scale ) );
-
-    } else {
-
-        dsTriggerOff( 'R2' );
+        const i = drivenIdx[ k ];
+        const s = Math.abs( tires.slipRatio[ i ] || 0 );
+        if ( s > maxDriveSlip ) maxDriveSlip = s;
 
     }
 
-    // ---- L2 (brake) — Forza-style ---------------------------------------
-    // Forza behaviour:
-    //   * Pedal weight scales with brake input — light tap is light,
-    //     pinning the pedal is heavy.
-    //   * Trail-braking (steering AND braking) adds extra stiffness so
-    //     the player feels the load transfer to the front wheels.
-    //   * ABS engagement → fast vibration that pulses the pedal back at
-    //     the player, matching what real ABS feels like through a pedal.
-    //   * Off-track (no wheel contact on multiple wheels) adds a light
-    //     surface-texture vibration so the player feels they've left
-    //     the racing line.
-    const brake = input.brake || 0;
-    const steerMag = Math.min( 1, Math.abs( input.steer || 0 ) );
+    // Kerb impact — frame-to-frame jump in any wheel's suspension load.
+    // We only care about positive jumps (compression spike from hitting a
+    // bump). 12 kN matches a kerb strike at speed without false-positives
+    // from gentle terrain.
+    let kerbSpike = 0;
+    for ( let i = 0; i < 4; i ++ ) {
 
-    // Event-only philosophy for the brake: free trigger normally,
-    // resistance ONLY when ABS engages or under a hard panic brake.
-    if ( drivetrain.abs.engaged && brake > 0.4 ) {
+        const inContact = vehicleController.wheelIsInContact( i );
+        const susp = inContact ? Math.max( 0, vehicleController.wheelSuspensionForce( i ) ) : 0;
+        const d = susp - ds.prevSusp[ i ];
+        if ( d > kerbSpike ) kerbSpike = d;
+        ds.prevSusp[ i ] = susp;
 
-        // ABS pulse — 12 Hz vibration, moderate force so the player
-        // still has brake authority. Only fires under sustained brake
-        // (was triggering on 0.15 which made every light tap pulse).
-        const absForce = Math.round( 100 * scale );
-        dsTriggerVibration( 'L2', 30, 12, Math.max( 60, Math.min( 130, absForce ) ) );
+    }
+    if ( kerbSpike > 12000 ) ds.kerbHitUntil = Math.max( ds.kerbHitUntil, now + 120 );
 
-    } else if ( brake > 0.75 ) {
+    // TC / wheelspin edge → 250 ms vibration burst on R2.
+    const wheelspinTrigger = drivetrain.tc.engaged || maxDriveSlip > 0.20;
+    if ( wheelspinTrigger && ! ds.prevTcEngaged ) ds.tcBumpUntil = now + 250;
+    ds.prevTcEngaged = wheelspinTrigger;
 
-        // Hard panic-brake only: light resistance over the back of the
-        // pull + a small trail-brake bump if cornering. Below 0.75 the
-        // trigger is completely free so the player has full modulation.
-        const trailBonus = steerMag * 20;
-        const f = Math.max( 25, Math.min( 90, Math.round( ( 40 + trailBonus ) * scale ) ) );
-        dsTriggerFeedback( 'L2', 60, f );
+    // ABS edge — hold the pulse for 100 ms after release so it never flickers.
+    if ( drivetrain.abs.engaged ) ds.absPulseUntil = now + 100;
+    ds.prevAbsEngaged = drivetrain.abs.engaged;
+
+    // Rev-limiter edge — fire a short weapon "wall" and lock it out for
+    // 350 ms so holding throttle at redline doesn't retrigger every frame.
+    if ( rpm >= redline * 0.99 && now >= ds.revLimitCooldownUntil ) {
+
+        ds.revLimitUntil = now + 180;
+        ds.revLimitCooldownUntil = now + 350;
+
+    }
+
+    // Shift micro-tick — rising edge of shiftCooldown above zero.
+    const shiftCd = transmission.shiftCooldown || 0;
+    if ( shiftCd > 0 && ds.prevShiftCd <= 0 ) ds.shiftTickUntil = now + 60;
+    ds.prevShiftCd = shiftCd;
+
+    // Scale-too-low short-circuit — sub-perceptual, kill everything.
+    if ( scale < 0.05 ) {
+
+        dsTriggerOff( 'L2' );
+        dsTriggerOff( 'R2' );
+        ds.lastL2Mode = 0;
+        ds.lastR2Mode = 0;
+        dsFlush();
+        return;
+
+    }
+
+    // -------- R2 priority chain (rev limit > wheelspin > shift tick > off) --------
+    // helper: only swap mode if the last mode has held HOLD_MS, else keep.
+    function setR2( mode, fn ) {
+
+        if ( mode !== ds.lastR2Mode && now - ds.lastR2ModeAt < HOLD_MS && ds.lastR2Mode !== 0 ) {
+
+            // Hold the previous non-OFF mode through the anti-flicker window,
+            // but always allow a stronger event (rev-limit) to pre-empt.
+            if ( ! ( mode === 0x02 && ds.lastR2Mode !== 0x02 ) ) return;
+
+        }
+        fn();
+        if ( mode !== ds.lastR2Mode ) { ds.lastR2Mode = mode; ds.lastR2ModeAt = now; }
+
+    }
+
+    if ( now < ds.revLimitUntil ) {
+
+        // Rev limiter: weapon wall 190→220, force 140 (momentary, allowed
+        // above the continuous ceiling). Player can still punch through.
+        setR2( 0x02, () => dsTriggerWeapon( 'R2', 190, 220, Math.min( 160, Math.round( 140 * Math.max( 1, scale * 0.9 ) ) ) ) );
+
+    } else if ( now < ds.tcBumpUntil ) {
+
+        // Wheelspin/TC — 12 Hz buzz across the back half of the pull so
+        // the player feels it ONLY when their foot is well into throttle.
+        const f = Math.max( 60, Math.min( 110, Math.round( 90 * scale ) ) );
+        setR2( 0x06, () => dsTriggerVibration( 'R2', 120, 12, f ) );
+
+    } else if ( now < ds.shiftTickUntil ) {
+
+        // Shift "click" — tiny weapon tick mid-pull. Skipped above because
+        // the rev-limit / wheelspin cues already own the trigger.
+        setR2( 0x02, () => dsTriggerWeapon( 'R2', 100, 140, Math.max( 50, Math.min( 100, Math.round( 80 * scale ) ) ) ) );
+
+    } else {
+
+        // Idle: trigger fully free. Reset the hold tracker so the next
+        // event can engage immediately.
+        dsTriggerOff( 'R2' );
+        if ( ds.lastR2Mode !== 0 ) { ds.lastR2Mode = 0; ds.lastR2ModeAt = now; }
+
+    }
+
+    // -------- L2 priority chain (ABS > kerb > hard brake > off) --------
+    function setL2( mode, fn ) {
+
+        if ( mode !== ds.lastL2Mode && now - ds.lastL2ModeAt < HOLD_MS && ds.lastL2Mode !== 0 ) {
+
+            // Allow ABS (vibration) to pre-empt feedback/weapon — it's the
+            // safety-critical cue.
+            if ( ! ( mode === 0x06 && ds.lastL2Mode !== 0x06 ) ) return;
+
+        }
+        fn();
+        if ( mode !== ds.lastL2Mode ) { ds.lastL2Mode = mode; ds.lastL2ModeAt = now; }
+
+    }
+
+    if ( now < ds.absPulseUntil && brake > 0.35 ) {
+
+        // ABS — signature GT effect. 12 Hz buzz from near the top of the
+        // pull (pos 25). Force grows with brake input so a panic stomp
+        // hits harder than a trail-brake nibble.
+        const absForce = Math.max( 70, Math.min( 110, Math.round( ( 60 + 50 * brake ) * scale ) ) );
+        setL2( 0x06, () => dsTriggerVibration( 'L2', 25, 12, absForce ) );
+
+    } else if ( now < ds.kerbHitUntil ) {
+
+        // Kerb impact — short hard feedback bump at mid-pull. ≤ 120 force.
+        const kf = Math.max( 60, Math.min( 120, Math.round( 90 * scale ) ) );
+        setL2( 0x01, () => dsTriggerFeedback( 'L2', 60, kf ) );
+
+    } else if ( brake > 0.65 ) {
+
+        // Hard braking, no ABS — light feedback with a trail-brake bonus.
+        // Trail bonus = |steer| × brake × 25 (so cornering load is felt).
+        // Force is capped well under 120 so the player can always push
+        // through to 100 % brake.
+        const trail = Math.min( 25, steerMag * brake * 25 );
+        const f = Math.max( 30, Math.min( 95, Math.round( ( 45 + trail ) * scale ) ) );
+        setL2( 0x01, () => dsTriggerFeedback( 'L2', 80, f ) );
 
     } else {
 
         dsTriggerOff( 'L2' );
+        if ( ds.lastL2Mode !== 0 ) { ds.lastL2Mode = 0; ds.lastL2ModeAt = now; }
 
     }
 
