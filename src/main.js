@@ -5,6 +5,13 @@ import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { RapierPhysics } from './lib/RapierPhysics.js';
 import { RapierHelper } from 'three/addons/helpers/RapierHelper.js';
 import Stats from 'three/addons/libs/stats.module.js';
+// Post-processing for cinematic distance blur (depth-of-field) on the huge
+// Spa map. Used only on maps that opt in via MAPS[id].dof — Nordschleife /
+// GP go straight through renderer.render() with zero overhead.
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { openRoom, generateRoomCode } from './lib/net.js';
 
 let camera, scene, renderer, stats;
@@ -2868,7 +2875,7 @@ const CONTROLS_KEYBOARD = [
     'L⇧ · upshift  ·  L⌃ · downshift',
     'R · reset',
     'C · cycle camera (chase / free / pov)',
-    '1 / 2 · cycle map',
+    '1 / 2 / 3 · cycle map (Nordschleife / GP / Spa)',
     'B · toggle ABS    ·    N · toggle traction control',
     'T · record 60s telemetry (input + output → JSON)'
 ];
@@ -3535,6 +3542,38 @@ const MAPS = {
         spawnPos: { x: 26.17, y: 26.07, z: 1219.19 },
         spawnRot: { x: 0.0037, y: - 0.0175, z: 0.0121, w: - 0.9998 }
     },
+    spa: {
+        // Spa-Francorchamps 1992 layout — community GLB with embedded
+        // PBR textures (~22 MB). The 14 km × 14 km map has ~5000 chunks
+        // so we MUST distance-cull or FPS dies; DoF then hides the cull
+        // edge by softening just the far horizon.
+        //
+        // BokehShader math (see node_modules/three/.../BokehShader.js):
+        //   factor   = focus + viewZ              // viewZ = -distance (m)
+        //   dofblur  = clamp(factor*aperture, ±maxblur)
+        // so blur is symmetric around `focus` metres in front of the
+        // camera, ramps linearly with distance-from-focus, and saturates
+        // at `maxblur` (a UV-space kernel radius, ~screen fraction).
+        //
+        // The previous values (focus 800, aperture 3e-5, maxblur 0.008)
+        // saturated the kernel for anything closer than ~530 m, so the
+        // car (≈10 m), tarmac, and kerbs all rendered at max blur — the
+        // entire frame was soft. New values place focus right at the
+        // chase-cam distance, then ramp the CoC so 1200 m hits the
+        // maxblur clamp just before the 1500 m chunk-cull boundary:
+        //   D=10 m  → ~ 0.10 px  (crisp player car)
+        //   D=50 m  → ~ 0.10 px  (crisp tarmac)
+        //   D=300 m → ~ 1.5 px   (slightly soft buildings)
+        //   D=800 m → ~ 4   px   (clearly soft far horizon)
+        //   D≥1200 m → maxblur   (hides the cull edge)
+        label: 'Spa-Francorchamps (1992)',
+        path: 'textures/models/spa.glb',
+        spawnPos: { x: - 2881.70, y: 81.22, z: 2612.47 },
+        spawnRot: { x: 0.0188, y: - 0.1562, z: - 0.0036, w: - 0.9875 },
+        renderRadius: 1500,
+        dof: { focus: 30, aperture: 0.0000051, maxblur: 0.006 },
+        carScale: 1.5
+    },
 };
 let currentMapId = 'nurburgring';
 let mapSwapInFlight = false;
@@ -3707,6 +3746,7 @@ async function init() {
         if ( k === 'q' || k === 'Q' ) cycleCar( 1 );
         if ( k === '1' ) swapMap( 'nurburgring' );
         if ( k === '2' ) swapMap( 'nurburgring_gp' );
+        if ( k === '3' ) swapMap( 'spa' );
         if ( k === 'F3' ) { event.preventDefault(); toggleStatsForNerds(); }
 
         if ( k === 'c' || k === 'C' ) cycleCameraMode();
@@ -3962,10 +4002,47 @@ function chunkTrackMeshes( sceneRoot, tileSize ) {
 
 }
 
+// Distance-based chunk visibility. For huge maps (Spa is 14 km × 14 km with
+// ~5000 chunks) we hide chunks whose XZ AABB is past the per-map
+// renderRadius from the car — they'd be invisible behind the horizon anyway,
+// and skipping them removes draw calls + frustum tests + the shadow loop's
+// per-chunk work below. Default `renderRadius = Infinity` keeps the
+// Nordschleife / GP maps drawing everything (those maps run fine).
+function updateTrackVisibility() {
+
+    if ( ! track || ! sunTarget ) return;
+    const radius = ( MAPS[ currentMapId ] && MAPS[ currentMapId ].renderRadius ) || Infinity;
+    if ( ! Number.isFinite( radius ) ) {
+
+        // Fast-path: nothing to cull. Make sure everything stays visible
+        // in case we swapped from a culling map back to an uncapped one.
+        for ( const child of track.children ) child.visible = true;
+        return;
+
+    }
+    const cx = sunTarget.position.x;
+    const cz = sunTarget.position.z;
+    const r2 = radius * radius;
+    for ( const child of track.children ) {
+
+        const bb = child.geometry && child.geometry.boundingBox;
+        if ( ! bb ) { child.visible = true; continue; }
+        // Closest-point distance from car to chunk AABB on XZ — accounts
+        // for chunks larger than the cull radius (always-visible if the
+        // car is inside their footprint).
+        const dx = Math.max( bb.min.x - cx, 0, cx - bb.max.x );
+        const dz = Math.max( bb.min.z - cz, 0, cz - bb.max.z );
+        child.visible = ( dx * dx + dz * dz ) < r2;
+
+    }
+
+}
+
 // AABB intersection between each track chunk and the sun's shadow camera
 // footprint (centered on the car). receiveShadow is only true on chunks that
 // can actually contain shadowed fragments — every other chunk skips the PCF
-// taps that the shader would otherwise do per fragment.
+// taps that the shader would otherwise do per fragment. Skips chunks already
+// hidden by updateTrackVisibility() since invisible chunks can't shadow.
 function updateTrackShadowReceive() {
 
     if ( ! track || ! sunTarget ) return;
@@ -3977,6 +4054,7 @@ function updateTrackShadowReceive() {
 
     for ( const child of track.children ) {
 
+        if ( ! child.visible ) { child.receiveShadow = false; continue; }
         const bb = child.geometry && child.geometry.boundingBox;
         if ( ! bb ) continue;
 
@@ -4154,6 +4232,24 @@ async function swapMap( id ) {
 
     // 5) Load the new track geometry + collider mesh.
     await loadTrack();
+
+    // 5a) Per-map atmosphere — depth-of-field bokeh softens distance so
+    //     the cull edge fades into natural camera blur instead of a hard
+    //     cliff. Composer is built lazily on first use and the bokeh pass
+    //     is enabled/disabled per map (no DoF = direct renderer.render).
+    setupDof( cfg.dof );
+
+    // 5b) Per-map whole-car scale — applied to the chassis root so every
+    //     visual child (body, wheels, lights, steering wheel) scales
+    //     uniformly. Physics collider + vehicle-controller wheels are
+    //     baked at creation and don't read mesh.scale, so handling is
+    //     unchanged. Default 1.0 restores original size on other maps.
+    if ( car ) {
+
+        const s = cfg.carScale || 1;
+        car.scale.setScalar( s );
+
+    }
 
     // 6) Teleport the car onto the new spawn — reuses the same reset path
     //    the R key already uses, just inlined because we don't want to wait
@@ -5682,6 +5778,16 @@ function updateWheels() {
     const wheelRotationQuat = new THREE.Quaternion();
     const up = new THREE.Vector3( 0, 1, 0 );
 
+    // The per-map car scale (carScale in MAPS) multiplies the chassis root
+    // node, so wheel.position values — set in physics metres — also get
+    // scaled, AND the wheel mesh's radius scales too. Two corrections:
+    //   1. Divide suspension travel by parent scale so the wheel CENTER
+    //      lands where physics says.
+    //   2. Add WHEEL_RADIUS·(1 − 1/scale) lift so the bigger wheel mesh
+    //      doesn't sink half its scaled radius into the ground.
+    const carScaleY = ( car && car.scale && car.scale.y ) ? car.scale.y : 1;
+    const wheelLift = WHEEL_RADIUS * ( 1 - 1 / carScaleY );
+
     wheels.forEach( ( wheel, index ) => {
 
         const wheelAxleCs = vehicleController.wheelAxleCs( index );
@@ -5690,7 +5796,7 @@ function updateWheels() {
         const steering = vehicleController.wheelSteering( index ) || 0;
         const rotationRad = vehicleController.wheelRotation( index ) || 0;
 
-        wheel.position.y = connection - suspension;
+        wheel.position.y = ( connection - suspension ) / carScaleY + wheelLift;
 
         wheelSteeringQuat.setFromAxisAngle( up, steering );
         wheelRotationQuat.setFromAxisAngle( wheelAxleCs, rotationRad );
@@ -5815,7 +5921,14 @@ function pollGamepad() {
     if ( dUp && ! prev[ 12 ] ) toggleStatsForNerds();
     if ( dDown && ! prev[ 13 ] ) toggleTractionControl();
     if ( dLeft && ! prev[ 14 ] ) toggleMinimap();
-    if ( dRight && ! prev[ 15 ] ) swapMap( currentMapId === 'nurburgring' ? 'nurburgring_gp' : 'nurburgring' );
+    if ( dRight && ! prev[ 15 ] ) {
+
+        // Cycle through MAPS in declaration order so D-pad → matches the
+        // 1 / 2 / 3 keyboard binds.
+        const ids = Object.keys( MAPS );
+        swapMap( ids[ ( ids.indexOf( currentMapId ) + 1 ) % ids.length ] );
+
+    }
     if ( start && ! prev[ 9 ] ) input.keyR = true; else if ( ! start && prev[ 9 ] ) input.keyR = false;
 
     // Any gamepad button press counts as a user gesture in modern browsers,
@@ -6298,6 +6411,48 @@ function onWindowResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize( window.innerWidth, window.innerHeight );
+    if ( dof.composer ) dof.composer.setSize( window.innerWidth, window.innerHeight );
+
+}
+
+// ---------------- depth-of-field composer ----------------
+// Built lazily on the first map that opts in via MAPS[id].dof so the cheaper
+// maps pay nothing. When `enabled` is false we render straight through
+// renderer.render(); when true we route through composer.render() with the
+// bokeh pass focusing at `cfg.focus` metres.
+
+const dof = { composer: null, bokeh: null, enabled: false };
+
+function setupDof( cfg ) {
+
+    if ( ! cfg ) {
+
+        dof.enabled = false;
+        return;
+
+    }
+    if ( ! dof.composer ) {
+
+        dof.composer = new EffectComposer( renderer );
+        dof.composer.setSize( window.innerWidth, window.innerHeight );
+        dof.composer.addPass( new RenderPass( scene, camera ) );
+        dof.bokeh = new BokehPass( scene, camera, {
+            focus: cfg.focus,
+            aperture: cfg.aperture,
+            maxblur: cfg.maxblur
+        } );
+        dof.composer.addPass( dof.bokeh );
+        dof.composer.addPass( new OutputPass() );
+
+    } else {
+
+        // Re-target the existing bokeh pass to this map's settings.
+        if ( dof.bokeh.uniforms[ 'focus' ] ) dof.bokeh.uniforms[ 'focus' ].value = cfg.focus;
+        if ( dof.bokeh.uniforms[ 'aperture' ] ) dof.bokeh.uniforms[ 'aperture' ].value = cfg.aperture;
+        if ( dof.bokeh.uniforms[ 'maxblur' ] ) dof.bokeh.uniforms[ 'maxblur' ].value = cfg.maxblur;
+
+    }
+    dof.enabled = true;
 
 }
 
@@ -6422,6 +6577,7 @@ function animate( time ) {
         sunTarget.position.copy( car.position );
         sunLight.position.copy( car.position ).add( sunOffset );
 
+        updateTrackVisibility();
         updateTrackShadowReceive();
 
     }
@@ -6435,7 +6591,8 @@ function animate( time ) {
 
     if ( physicsHelper && physicsHelper.visible ) physicsHelper.update();
 
-    renderer.render( scene, camera );
+    if ( dof.enabled && dof.composer ) dof.composer.render();
+    else renderer.render( scene, camera );
     renderMinimap();
 
     stats.update();
