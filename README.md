@@ -2,7 +2,7 @@
 
 ## Latest Commit
 
-- Suzuka: make the NODE.001 cube non-collidable (the prior GLB strip pass dropped 8 triangles but the cube was still visually present, so kinematics-only fix as fallback). New per-map `nonCollidableMaterials: ['NODE.001']` config; `loadTrack` tags any mesh whose material name is in that list with `obj.userData.nonCollidable = true`, and the trimesh collider builder skips them. Visual stays (still flat grey from the prior `materialOverrides` pass), car drives through. Grandstand-seat meshes elsewhere lose collision too — fine since players don't drive into stands and clipping is better than an invisible wall. Generic abstraction usable for any future map's debug materials. **(HEAD)**
+- Calm controller rumble (Web Gamepad Haptic Actuator) — "Art of Rally" feel. Always-on continuous surface buzz scales with speed (weak motor, max 0.08 magnitude — barely a hiss). Tyre slide past 10° slip angle adds a gentle continuous on top (max 0.18). One-shot pulses for suspension impulse spikes (kerb / pothole / landing — scaled by wheelSuspensionForce frame-delta, max 0.4), TC engage (0.15 weak-only tick), ABS engage (0.20 strong-only pulse mimicking the pedal). API can't loop, so a 90ms re-issue cycle with 140ms duration keeps the continuous channel gap-free without thrashing `playEffect`. Silently no-ops on Safari / pads without a `vibrationActuator`. Works in Chrome / Edge on macOS + Windows over USB and Bluetooth for DualSense / DualShock 4 / Xbox pads. **(HEAD)**
 
 ## all commits
 

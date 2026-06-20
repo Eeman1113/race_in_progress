@@ -762,6 +762,133 @@ function updateBrakeLights() {
 
 }
 
+// ---------------- controller rumble (Web Gamepad Haptic Actuator) ----------------
+//
+// "Art of Rally" style calm haptics: a barely-there continuous surface
+// buzz, a touch more when a tyre is sliding, short event pulses on curb
+// hits / ABS / TC engagement. Magnitudes capped low — this should never
+// feel like the controller is angry.
+//
+// The Web Gamepad API can't loop: `playEffect('dual-rumble', ...)` is
+// one-shot. To fake continuous we re-issue every `reIssueMs` with a
+// slightly longer `duration` so the next effect overlaps the previous.
+// Magnitudes 0..1 — `weak` is the small motor (high-freq buzz), `strong`
+// is the heavy motor (low-freq thump). Works in Chrome/Edge on macOS +
+// Windows over USB and Bluetooth for DualSense / DualShock 4 / Xbox
+// pads. Silently no-ops on Safari and on pads without `vibrationActuator`.
+
+const rumble = {
+    enabled: true,
+    // continuous baseline (set every frame from car state)
+    contWeak: 0, contStrong: 0,
+    // one-shot pulse (decays to 0 when onceEndsAt is in the past)
+    onceWeak: 0, onceStrong: 0, onceEndsAt: 0,
+    // re-issue throttle so we don't hammer playEffect every animation tick
+    lastIssued: 0, reIssueMs: 90,
+    // edge tracking
+    prevTcEngaged: false, prevAbsEngaged: false,
+    prevSusp: [ 0, 0, 0, 0 ]
+};
+
+function rumblePulse( weak, strong, durationMs ) {
+
+    if ( ! rumble.enabled ) return;
+    const now = performance.now();
+    const end = now + durationMs;
+    // strongest pulse wins until it expires
+    if ( end > rumble.onceEndsAt
+        || weak > rumble.onceWeak
+        || strong > rumble.onceStrong ) {
+
+        rumble.onceWeak = weak;
+        rumble.onceStrong = strong;
+        rumble.onceEndsAt = end;
+
+    }
+
+}
+
+function rumbleSetContinuous( weak, strong ) {
+
+    rumble.contWeak = weak;
+    rumble.contStrong = strong;
+
+}
+
+function rumbleTick() {
+
+    if ( ! rumble.enabled || gamepad.index < 0 ) return;
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    const pad = pads[ gamepad.index ];
+    if ( ! pad || ! pad.vibrationActuator || ! pad.vibrationActuator.playEffect ) return;
+    const now = performance.now();
+    let oW = 0, oS = 0;
+    if ( now < rumble.onceEndsAt ) { oW = rumble.onceWeak; oS = rumble.onceStrong; }
+    const weak = Math.max( oW, rumble.contWeak );
+    const strong = Math.max( oS, rumble.contStrong );
+    if ( weak < 0.01 && strong < 0.01 ) return; // silence — nothing to play
+    if ( now - rumble.lastIssued < rumble.reIssueMs ) return;
+    rumble.lastIssued = now;
+    pad.vibrationActuator.playEffect( 'dual-rumble', {
+        startDelay: 0,
+        duration: 140,
+        weakMagnitude: Math.min( 1, weak ),
+        strongMagnitude: Math.min( 1, strong )
+    } ).catch( () => {} );
+
+}
+
+function updateRumble( speed ) {
+
+    if ( ! rumble.enabled || ! vehicleController ) return;
+    // 1) Continuous surface buzz — proportional to speed, capped low. The
+    //    weak motor is the small high-freq one; perfect for a "tyres on
+    //    tarmac" hiss without the heavy thumping you get from a strong
+    //    motor at the same magnitude.
+    const speedKmh = Math.abs( speed ) * 3.6;
+    let surface = 0;
+    if ( speedKmh > 3 ) surface = Math.min( 0.08, speedKmh / 800 );
+
+    // 2) Tyre slide — lateral slip angle past peak. Light continuous
+    //    rumble that gets your attention without screaming.
+    let slide = 0;
+    for ( let i = 0; i < 4; i ++ ) {
+        if ( ! vehicleController.wheelIsInContact( i ) ) continue;
+        const slip = Math.abs( tires.slipAngle[ i ] );
+        if ( slip > 0.18 ) {
+            const mag = Math.min( 0.18, ( slip - 0.18 ) * 1.4 );
+            if ( mag > slide ) slide = mag;
+        }
+    }
+    rumbleSetContinuous( surface + slide * 0.5, slide );
+
+    // 3) Suspension impulse spikes — kerb / pothole / hard landing.
+    //    Look at the per-frame delta in wheel suspension force; sudden
+    //    jumps trigger a short one-shot pulse scaled by the impulse size.
+    for ( let i = 0; i < 4; i ++ ) {
+        const susp = vehicleController.wheelIsInContact( i )
+            ? Math.max( 0, vehicleController.wheelSuspensionForce( i ) )
+            : 0;
+        const prev = rumble.prevSusp[ i ];
+        const delta = Math.abs( susp - prev );
+        if ( delta > 6000 ) {
+            const intensity = Math.min( 0.4, delta / 30000 );
+            rumblePulse( intensity * 0.6, intensity, 80 );
+        }
+        rumble.prevSusp[ i ] = susp;
+    }
+
+    // 4) TC engage edge — weak-motor-only tick to flag the cut.
+    if ( drivetrain.tc.engaged && ! rumble.prevTcEngaged ) rumblePulse( 0.15, 0, 70 );
+    rumble.prevTcEngaged = drivetrain.tc.engaged;
+
+    // 5) ABS engage edge — strong-motor-only pulse, like the real-world
+    //    pedal pulsing on the foot.
+    if ( drivetrain.abs.engaged && ! rumble.prevAbsEngaged ) rumblePulse( 0, 0.20, 60 );
+    rumble.prevAbsEngaged = drivetrain.abs.engaged;
+
+}
+
 // ---------------- skid marks ----------------
 
 const SKID_MAX = 800;
@@ -6821,6 +6948,8 @@ function animate( time ) {
         updateWheels();
         updateSpeedometer( speed );
         updateBrakeLights();
+        updateRumble( speed );
+        rumbleTick();
         updateSkidMarks();
 
         statsForNerds.lastDelta = delta;
