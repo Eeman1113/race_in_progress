@@ -217,6 +217,56 @@ function cycleCameraMode() {
 
 }
 
+// ---------------- crosshair raycast (X to identify mesh) ----------------
+//
+// Aim the camera at any mesh, press X, and we'll print the material
+// name + world hit position. Useful for finding the junk meshes baked
+// into the community track GLBs (debug cubes, leftover placeholders)
+// without having to re-bake the asset — add the dumped (x, y, z) to
+// `MAPS[id].excludeMeshesNear` and reload.
+
+const _pickRaycaster = new THREE.Raycaster();
+const _pickOrigin = new THREE.Vector2( 0, 0 );
+
+function pickMeshAtCrosshair() {
+
+    if ( ! camera || ! track ) return;
+    _pickRaycaster.setFromCamera( _pickOrigin, camera );
+    // Walk the entire track tree because chunked meshes live under a flat group.
+    const hits = _pickRaycaster.intersectObject( track, true );
+    if ( ! hits.length ) {
+
+        console.log( '[pick] no mesh under crosshair' );
+        return;
+
+    }
+    const hit = hits[ 0 ];
+    const mat = hit.object && hit.object.material;
+    const matName = mat && mat.name ? mat.name : '(unnamed)';
+    const p = hit.point;
+    console.log( `[pick] mat="${ matName }"  world (${ p.x.toFixed( 2 ) }, ${ p.y.toFixed( 2 ) }, ${ p.z.toFixed( 2 ) })  dist ${ hit.distance.toFixed( 1 ) }m  meshName="${ hit.object.name || '' }"` );
+    showPickToast( matName, p );
+
+}
+
+let _pickToastEl = null;
+let _pickToastTimer = 0;
+function showPickToast( matName, p ) {
+
+    if ( ! _pickToastEl ) {
+
+        _pickToastEl = document.createElement( 'div' );
+        _pickToastEl.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.85);color:#FFCB47;font-family:Monospace;font-size:14px;padding:10px 14px;border-radius:6px;pointer-events:none;z-index:9999;border:1px solid rgba(255,203,71,0.4);';
+        document.body.appendChild( _pickToastEl );
+
+    }
+    _pickToastEl.textContent = `pick: "${ matName }"  @  ${ p.x.toFixed( 2 ) }, ${ p.y.toFixed( 2 ) }, ${ p.z.toFixed( 2 ) }`;
+    _pickToastEl.style.display = 'block';
+    clearTimeout( _pickToastTimer );
+    _pickToastTimer = setTimeout( () => { if ( _pickToastEl ) _pickToastEl.style.display = 'none'; }, 4000 );
+
+}
+
 // ---------------- car swap (Q to cycle) ----------------
 
 function applyCarConfig( car, skipVisuals ) {
@@ -3783,6 +3833,12 @@ async function init() {
         if ( k === 'F3' ) { event.preventDefault(); toggleStatsForNerds(); }
 
         if ( k === 'c' || k === 'C' ) cycleCameraMode();
+
+        // X — raycast through the centre of the screen and dump the
+        // material name + world position of whatever's hit. Used to
+        // identify random junk meshes baked into community track GLBs
+        // so they can be added to the per-map excludeMeshesNear list.
+        if ( k === 'x' || k === 'X' ) pickMeshAtCrosshair();
 
         if ( k === 'h' || k === 'H' ) {
 
