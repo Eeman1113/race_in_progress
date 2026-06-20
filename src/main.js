@@ -3195,16 +3195,19 @@ const input = {
 // was available at any speed. The settings below are exposed at module
 // scope so they can be tweaked live from the console.
 const steeringCfg = {
-    deadzone: 0.045,            // extra deadzone applied AFTER source merging
-    curveExponent: 1.7,         // 1.0 = linear; >1 = softer near center
+    deadzone: 0.06,             // wider deadzone — small stick wobble no longer steers
+    curveExponent: 2.1,         // softer near center → small inputs barely turn (was 1.7)
     // Speed-sensitive reduction. Max steering scales from 1.0 at standstill
     // down to `minFactor` at `vReduceMax` m/s and stays clamped above that.
-    minFactor: 0.40,
-    vReduceMax: 55,             // m/s ≈ 198 km/h
+    // Tighter clamp + earlier ramp → much harder to flick the car into a spin
+    // at speed (was minFactor 0.40 / vReduceMax 55).
+    minFactor: 0.30,
+    vReduceMax: 42,             // m/s ≈ 150 km/h — full reduction reached sooner
     // dt-aware smoothing rates. Return-to-center is faster than steer-in so
     // the car settles back to straight rather than asymptotically lingering.
-    smoothInRate: 14,
-    smoothReturnRate: 22,
+    // Slower in-rate prevents panic jerks from snapping the rear loose.
+    smoothInRate: 10,
+    smoothReturnRate: 18,
     // Snap-to-zero threshold (radians) when the target is zero. Catches the
     // long tail of the exponential decay so the wheels actually reach 0.
     zeroSnapRad: 0.001
@@ -3217,18 +3220,18 @@ const steeringCfg = {
 // for the stats panel. Toggle with N (keyboard) / D-pad down (gamepad).
 const tcCfg = {
     enabled: true,
-    slipThreshold: 0.16,        // peak Pacejka slip is ~0.14
-    cutGain: 4.5,               // torque cut per unit of slip overshoot
-    minMult: 0.18,              // never cut all the way to zero
+    slipThreshold: 0.13,        // engages earlier (was 0.16) — peak Pacejka slip is ~0.14
+    cutGain: 6.0,               // harder cut per unit of slip overshoot (was 4.5)
+    minMult: 0.15,              // can cut to 15% throttle (was 18%)
     // Low-speed exemption: below this speed TC is fully off. The slip-ratio
     // math is mathematically unstable here (divides by tiny speed) and we
     // don't want to choke launches from a standstill / uphill / sand.
-    minActiveSpeed: 1.2,
+    minActiveSpeed: 1.0,
     // Speed-based fade-in: between minActiveSpeed and fadeInSpeed the TC
     // cut amount scales from 0 → full so it doesn't snap from "no cut" to
     // "−82%" the moment we cross 1.2 m/s. Without this the player gets
     // stuck at ~4 km/h on any slope — throttle dies on hill starts.
-    fadeInSpeed: 6.0,
+    fadeInSpeed: 4.5,           // full TC reached sooner (was 6.0)
     // Per-car grip scaling: cars with higher wheelFrictionSlip get
     // proportionally more slip headroom before TC engages.
     gripScale: 0.10
@@ -3241,9 +3244,9 @@ const tcCfg = {
 // (keyboard) / B-button (gamepad).
 const absCfg = {
     enabled: true,
-    slipThreshold: 0.18,        // a touch wider than TC — braking slip is harder to recover from
-    cutGain: 5.0,
-    minMult: 0.20,
+    slipThreshold: 0.15,        // engages sooner (was 0.18) — keeps wheels rolling longer under panic-brake
+    cutGain: 6.0,               // (was 5.0)
+    minMult: 0.18,              // (was 0.20)
     minActiveSpeed: 1.5         // exempt at crawl so we don't release-pulse the handbrake/parking brake
 };
 
@@ -3301,12 +3304,12 @@ const CARS = [
         bodyColor: 0xFFCB47,
         soundFile: 'sounds/engines/hatchback.mp3', soundLoopStart: 3.0,
         pitchMin: 0.55, pitchMax: 2.8,
-        mass: 10, chassisFriction: 0.8,
+        mass: 10, chassisFriction: 0.9,
         maxEngineForce: 62, engineIdleRpm: 900, engineRedline: 7000,
         peakTorqueRpm: 4200, torqueCurveWidth: 2300,
         gearRatios: [ 3.5, 2.1, 1.4, 1.0, 0.78 ], reverseRatio: - 3.4, finalDrive: 3.7,
         autoUpshiftRpm: 5900, autoDownshiftRpm: 2200,
-        wheelFrictionSlip: 2.1,
+        wheelFrictionSlip: 2.7,
         suspensionStiffness: 22, suspensionCompression: 1.9, suspensionRelaxation: 2.3,
         suspensionRestLength: 0.42, wheelConnectionY: - 0.30,
         maxBrakeForce: 1.25, handbrakeMultiplier: 1.6, maxSteeringAngle: Math.PI / 4,
@@ -3323,12 +3326,12 @@ const CARS = [
         bodyColor: 0xB42020,
         soundFile: 'sounds/engines/muscle.mp3', soundLoopStart: 3.0,
         pitchMin: 0.6, pitchMax: 2.2,
-        mass: 14, chassisFriction: 0.8,
+        mass: 14, chassisFriction: 0.9,
         maxEngineForce: 130, engineIdleRpm: 750, engineRedline: 6800,
         peakTorqueRpm: 3500, torqueCurveWidth: 3000,
         gearRatios: [ 3.66, 2.43, 1.69, 1.32, 1.0, 0.79 ], reverseRatio: - 3.5, finalDrive: 3.55,
         autoUpshiftRpm: 5700, autoDownshiftRpm: 1900,
-        wheelFrictionSlip: 1.95,
+        wheelFrictionSlip: 2.55,
         suspensionStiffness: 23, suspensionCompression: 1.95, suspensionRelaxation: 2.35,
         suspensionRestLength: 0.42, wheelConnectionY: - 0.32,
         maxBrakeForce: 1.5, handbrakeMultiplier: 1.7, maxSteeringAngle: Math.PI / 4.2,
@@ -3345,12 +3348,12 @@ const CARS = [
         bodyColor: 0xC8CDD2,
         soundFile: 'sounds/engines/sport.mp3', soundLoopStart: 3.0,
         pitchMin: 0.7, pitchMax: 3.2,
-        mass: 11, chassisFriction: 0.88,
+        mass: 11, chassisFriction: 0.95,
         maxEngineForce: 150, engineIdleRpm: 1100, engineRedline: 9200,
         peakTorqueRpm: 7000, torqueCurveWidth: 1900,
         gearRatios: [ 3.91, 2.29, 1.65, 1.30, 1.08, 0.88 ], reverseRatio: - 3.55, finalDrive: 3.97,
         autoUpshiftRpm: 8700, autoDownshiftRpm: 3400,
-        wheelFrictionSlip: 3.1,
+        wheelFrictionSlip: 3.5,
         suspensionStiffness: 38, suspensionCompression: 2.8, suspensionRelaxation: 3.0,
         suspensionRestLength: 0.28, wheelConnectionY: - 0.26,
         maxBrakeForce: 2.1, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4,
@@ -3367,12 +3370,12 @@ const CARS = [
         bodyColor: 0x1F4DFF,
         soundFile: 'sounds/engines/rally.mp3', soundLoopStart: 3.0,
         pitchMin: 0.65, pitchMax: 2.9,
-        mass: 11, chassisFriction: 0.9,
+        mass: 11, chassisFriction: 0.95,
         maxEngineForce: 135, engineIdleRpm: 900, engineRedline: 7800,
         peakTorqueRpm: 3400, torqueCurveWidth: 3400,
         gearRatios: [ 3.64, 2.37, 1.76, 1.35, 1.06, 0.84 ], reverseRatio: - 3.55, finalDrive: 3.90,
         autoUpshiftRpm: 6700, autoDownshiftRpm: 2700,
-        wheelFrictionSlip: 2.55,
+        wheelFrictionSlip: 3.05,
         suspensionStiffness: 26, suspensionCompression: 2.1, suspensionRelaxation: 2.5,
         suspensionRestLength: 0.48, wheelConnectionY: - 0.34,
         maxBrakeForce: 1.8, handbrakeMultiplier: 2.4, maxSteeringAngle: Math.PI / 3.8,
@@ -3389,12 +3392,12 @@ const CARS = [
         bodyColor: 0xFF6F1A,
         soundFile: 'sounds/engines/supercar.mp3', soundLoopStart: 3.0,
         pitchMin: 0.7, pitchMax: 3.4,
-        mass: 12, chassisFriction: 0.88,
+        mass: 12, chassisFriction: 0.95,
         maxEngineForce: 185, engineIdleRpm: 1000, engineRedline: 9000,
         peakTorqueRpm: 6500, torqueCurveWidth: 3200,
         gearRatios: [ 3.08, 2.19, 1.63, 1.29, 1.03, 0.84, 0.69 ], reverseRatio: - 2.9, finalDrive: 4.10,
         autoUpshiftRpm: 8500, autoDownshiftRpm: 3200,
-        wheelFrictionSlip: 2.95,
+        wheelFrictionSlip: 3.4,
         suspensionStiffness: 34, suspensionCompression: 2.6, suspensionRelaxation: 2.9,
         suspensionRestLength: 0.28, wheelConnectionY: - 0.25,
         maxBrakeForce: 2.2, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4,
@@ -3417,12 +3420,12 @@ const CARS = [
         bodyColor: 0xD11A1A,
         soundFile: 'sounds/engines/f1.mp3', soundLoopStart: 3.0,
         pitchMin: 1.0, pitchMax: 4.0,
-        mass: 7, chassisFriction: 0.92,
+        mass: 7, chassisFriction: 0.95,
         maxEngineForce: 200, engineIdleRpm: 4500, engineRedline: 17500,
         peakTorqueRpm: 12000, torqueCurveWidth: 4500,
         gearRatios: [ 2.90, 2.20, 1.75, 1.42, 1.18, 1.0, 0.86, 0.74 ], reverseRatio: - 2.5, finalDrive: 4.0,
         autoUpshiftRpm: 16500, autoDownshiftRpm: 6500,
-        wheelFrictionSlip: 4.2,
+        wheelFrictionSlip: 4.6,
         suspensionStiffness: 44, suspensionCompression: 3.0, suspensionRelaxation: 3.3,
         suspensionRestLength: 0.22, wheelConnectionY: - 0.22,
         maxBrakeForce: 3.2, handbrakeMultiplier: 1.4, maxSteeringAngle: Math.PI / 5.0,
@@ -3444,7 +3447,7 @@ const CARS = [
         peakTorqueRpm: 10000, torqueCurveWidth: 9000,
         gearRatios: [ 3.2, 2.6, 2.1, 1.75, 1.45, 1.2, 1.0, 0.85, 0.72, 0.6 ], reverseRatio: - 3.0, finalDrive: 4.0,
         autoUpshiftRpm: 19000, autoDownshiftRpm: 2500,
-        wheelFrictionSlip: 5.0,
+        wheelFrictionSlip: 5.5,
         suspensionStiffness: 48, suspensionCompression: 3.1, suspensionRelaxation: 3.3,
         suspensionRestLength: 0.28, wheelConnectionY: - 0.25,
         maxBrakeForce: 5.5, handbrakeMultiplier: 2.0, maxSteeringAngle: Math.PI / 4,
