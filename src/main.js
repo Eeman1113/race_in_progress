@@ -940,6 +940,10 @@ const ds = {
     disabled: false,         // hard kill after repeated write failures
     lastFlushAt: 0,          // last successful HID write timestamp
     minFlushMs: 33,          // ~30 Hz cap on outbound reports
+    // BT-only: monotonic seq nibble that gets written into payload[0] high
+    // nibble of every outbound report. Some firmwares (verified against
+    // daidr/dualsense-tester) ignore reports whose seq doesn't advance.
+    btSeq: 0,
     // Cached trigger state — when both sides match what we last sent and
     // it's within minFlushMs of the last write, we skip the HID call.
     // Each side is { mode, p: [10 bytes] }.
@@ -953,7 +957,13 @@ const ds = {
     },
     // Edge-tracking for the mapper.
     prevTcEngaged: false,
-    tcBumpUntil: 0
+    tcBumpUntil: 0,
+    prevAbsEngaged: false,
+    absPulseUntil: 0,
+    prevOffTrack: false,
+    // Debug: when > 0, _dsTestForce overrides the L2 mapper output with a
+    // constant Feedback force. Wired up by the "TEST L2" slider in #info.
+    testForceL2: 0
 };
 
 // Sony's HID filter — covers the DualSense USB IDs we've seen in the wild.
@@ -1088,16 +1098,32 @@ async function dsFlush() {
     if ( ! lDirty && ! rDirty ) return;
     if ( now - ds.lastFlushAt < ds.minFlushMs ) return;
 
-    // Build the "common" payload (everything past the report-id and any
-    // BT-only prefix). Offsets follow the standard DualSense output report.
-    // Total common length = 47 bytes (USB writes these 47; BT pads and
-    // appends CRC32).
+    // Build the 47-byte struct payload (verified against
+    // daidr/dualsense-tester `src/router/DualSense/views/_OutputPanel/
+    // outputStruct.ts`). Field order: validFlag0, validFlag1, rumbleR,
+    // rumbleL, headphoneVol, speakerVol, micVol, audioCtrl, muteLed,
+    // pwrSaveMute, R2.mode, R2.p0..p9, L2.mode, L2.p0..p9, ...reserved,
+    // hapticVol, audioCtrl2, validFlag2, ...reserved, lightbarSetup,
+    // ledBrightness, playerIndicator, ledRGB.
+    //
+    // Earlier impl set validFlag1=0x00. The reference defaults it to 0xF7
+    // (= mask-out LED/mute/mic touches the firmware would otherwise apply).
+    // With flag1=0 some firmware revisions reset the trigger block before
+    // applying it — explaining "no resistance at all" even with perfect
+    // mode bytes. We now match the reference and force-set flag1 bit 3
+    // OFF only when we actually want to drive LED brightness (we never do).
     const common = new Uint8Array( 47 );
-    // Feature flags: bit0 = rumble enable (we leave 0 here so Gamepad-API
-    // rumble keeps owning the motors), bit2 = right-trigger effect,
-    // bit3 = left-trigger effect.
+    // validFlag0 bit2 = right-trigger effect enable, bit3 = left-trigger
+    // effect enable. Bits 0/1 (rumble enable) stay 0 here because
+    // navigator.getGamepads().vibrationActuator owns the motors on a
+    // separate code path.
     common[ 0 ] = 0x04 | 0x08;
-    common[ 1 ] = 0x00; // we don't touch LED / mute / mic — leave those bits 0
+    // validFlag1: mirror the reference's "don't touch the audio/LED stack"
+    // default. 0xF7 = bits 0,1,2,4,5,6,7 set (bit3 cleared = "don't drive
+    // LED brightness"). Without these enable bits the firmware ignores
+    // entire blocks of the output report, including — surprise — the
+    // adaptive-trigger block on some firmware versions.
+    common[ 1 ] = 0xF7;
     // Motor magnitudes (offset 2 / 3) stay 0 — rumbleTick() handles those
     // through navigator.getGamepads().vibrationActuator on a different code path.
     // R2 block starts at offset 10 (R2 mode at 10, R2 params 11..20).
@@ -1113,24 +1139,33 @@ async function dsFlush() {
 
         if ( ds.transport === 'bt' ) {
 
-            // BT report: id=0x31, payload 74 bytes + 4-byte CRC32 trailer.
-            // First 2 bytes inside the payload are BT-specific feature
-            // flags ( 0x02 = "this report contains DualSense data", 0x00 ).
-            const payload = new Uint8Array( 78 );
-            payload[ 0 ] = 0x02;
-            payload[ 1 ] = 0x00;
+            // BT output report: id=0x31, total 77 bytes (NOT 78). The first
+            // 2 bytes are a BT framing header — byte 0 is `seq << 4` (high
+            // nibble is a monotonic sequence counter, low nibble unused),
+            // byte 1 is 0x10 (=DS5 output sub-type). Bytes 2..48 hold the
+            // 47-byte common struct. Bytes 49..72 stay zero (padding for
+            // fields we don't touch). Bytes 73..76 are CRC32 of
+            // [0xA2, 0x31, ...payload[0..72]].
+            //
+            // Earlier impl wrote 78 bytes with [0x02, 0x00, ...] as the
+            // prefix — that's a USB-style header. The DS5 firmware silently
+            // drops BT reports of the wrong length / wrong header, which is
+            // exactly the symptom the user described.
+            const payload = new Uint8Array( 77 );
+            payload[ 0 ] = ( ds.btSeq << 4 ) & 0xFF;
+            ds.btSeq = ( ds.btSeq + 1 ) & 0xFF;
+            payload[ 1 ] = 0x10;
             for ( let i = 0; i < 47; i ++ ) payload[ 2 + i ] = common[ i ];
-            // CRC is computed over [0xA2 (the BT message-type byte),
-            // reportId (0x31), payload[0..73]] = 75 bytes total.
-            const seed = new Uint8Array( 1 + 1 + 74 );
+            // CRC is computed over [0xA2, 0x31, payload[0..72]] = 75 bytes.
+            const seed = new Uint8Array( 2 + 73 );
             seed[ 0 ] = 0xA2;
             seed[ 1 ] = 0x31;
-            for ( let i = 0; i < 74; i ++ ) seed[ 2 + i ] = payload[ i ];
+            for ( let i = 0; i < 73; i ++ ) seed[ 2 + i ] = payload[ i ];
             const crc = _dsCrc32( seed );
-            payload[ 74 ] = crc & 0xFF;
-            payload[ 75 ] = ( crc >>> 8 ) & 0xFF;
-            payload[ 76 ] = ( crc >>> 16 ) & 0xFF;
-            payload[ 77 ] = ( crc >>> 24 ) & 0xFF;
+            payload[ 73 ] = crc & 0xFF;
+            payload[ 74 ] = ( crc >>> 8 ) & 0xFF;
+            payload[ 75 ] = ( crc >>> 16 ) & 0xFF;
+            payload[ 76 ] = ( crc >>> 24 ) & 0xFF;
             await ds.device.sendReport( 0x31, payload );
 
         } else {
@@ -1365,6 +1400,58 @@ function initDualsenseButton() {
     if ( anchor && anchor.nextSibling ) infoEl.insertBefore( row, anchor.nextSibling );
     else infoEl.appendChild( row );
 
+    // ---- TEST L2 slider — debug, will be removed ------------------------
+    // Sits directly under the "+ adaptive triggers" button. Slides 0..255
+    // and feeds straight into ds.testForceL2; when > 0, updateDualsense()
+    // ignores the per-frame mapper for L2 and just hands the requested
+    // constant force to the controller. Lets the player verify the
+    // protocol works in isolation. NOT persisted to localStorage.
+    const testRow = document.createElement( 'div' );
+    testRow.className = 'volume-row';
+
+    const testLabel = document.createElement( 'span' );
+    testLabel.textContent = 'TEST L2';
+    testLabel.style.opacity = '0.6';
+    testLabel.style.fontStyle = 'italic';
+    testLabel.title = 'debug — will be removed';
+
+    const testSlider = document.createElement( 'input' );
+    testSlider.type = 'range';
+    testSlider.min = '0';
+    testSlider.max = '255';
+    testSlider.step = '1';
+    testSlider.value = '0';
+    testSlider.title = 'test — will be removed';
+
+    const testReadout = document.createElement( 'span' );
+    testReadout.textContent = '0';
+    testReadout.style.opacity = '0.6';
+
+    testRow.appendChild( testLabel );
+    testRow.appendChild( testSlider );
+    testRow.appendChild( testReadout );
+    if ( row.nextSibling ) infoEl.insertBefore( testRow, row.nextSibling );
+    else infoEl.appendChild( testRow );
+
+    testSlider.addEventListener( 'input', () => {
+
+        const v = Math.max( 0, Math.min( 255, parseInt( testSlider.value, 10 ) || 0 ) );
+        ds.testForceL2 = v;
+        testReadout.textContent = String( v );
+        // Bypass the rate-limit on this gesture so the player gets
+        // immediate tactile confirmation as they drag.
+        if ( ds.device && ! ds.disabled ) {
+
+            if ( v > 0 ) dsTriggerFeedback( 'L2', 20, v );
+            else dsTriggerOff( 'L2' );
+            ds.lastFlushAt = 0;
+            dsFlush();
+
+        }
+
+    } );
+    if ( typeof _positionStatsBelowInfo === 'function' ) _positionStatsBelowInfo();
+
     _dsButtonEl = btn;
     _dsUpdateButton();
 
@@ -1414,7 +1501,10 @@ function updateDualsense( speed ) {
 
     if ( ! ds.device || ds.disabled ) return;
     // Honour the master "haptics off" slider — RUM=0 → all triggers OFF.
-    if ( rumble.strength <= 0 ) {
+    // The TEST L2 slider is a debug override that ignores RUM specifically
+    // so the player can verify the protocol works in isolation.
+    const testActive = ds.testForceL2 > 0;
+    if ( rumble.strength <= 0 && ! testActive ) {
 
         dsTriggerOff( 'L2' );
         dsTriggerOff( 'R2' );
@@ -1428,69 +1518,108 @@ function updateDualsense( speed ) {
     const scale = Math.min( 1.5, rumble.strength * 1.5 );
     const now = performance.now();
 
-    // ---- R2 (throttle) ---------------------------------------------------
-    // Feedback resistance that climbs from idle to redline; past redline
-    // a Weapon-mode wall for the rev-limiter clack. Force range is the
-    // native 0..255 — earlier impl was clamped to 0..8 (~3% of max) so
-    // the trigger felt completely loose.
+    // ---- R2 (throttle) — Forza-style ------------------------------------
+    // Forza Horizon 5 / Motorsport behaviour we're replicating:
+    //   * Light constant resistance off-throttle so the pedal has weight.
+    //   * Resistance climbs with engine load (≈ RPM × throttle), so
+    //     stabbing the pedal at low RPM feels lighter than holding it
+    //     pinned at redline.
+    //   * On wheelspin (TC engaged), a short vibration burst on R2 —
+    //     "the tyre is slipping, lift!" cue.
+    //   * Rev limiter: Weapon-mode hard wall past redline. This is the
+    //     one cue we ALWAYS deliver at full force, regardless of scale.
     const rpm = engine.rpm || 0;
     const redline = engine.redline || 7500;
     const idle = engine.idleRpm || 900;
     const rpmNorm = Math.max( 0, Math.min( 1.2, ( rpm - idle ) / Math.max( 1, redline - idle ) ) );
-    if ( drivetrain.tc.engaged && ! ds.prevTcEngaged ) ds.tcBumpUntil = now + 200;
+    const throttle = Math.max( 0, Math.min( 1, input.throttle || 0 ) );
+    const load = Math.max( rpmNorm * 0.6, rpmNorm * throttle );
+    if ( drivetrain.tc.engaged && ! ds.prevTcEngaged ) ds.tcBumpUntil = now + 220;
     ds.prevTcEngaged = drivetrain.tc.engaged;
     const tcBumping = now < ds.tcBumpUntil;
 
     if ( rpm >= redline * 0.99 ) {
 
-        // Rev limiter: hard wall at trigger pos ~180/255 (~70 % pulled),
-        // snapping free at ~230. Always at full force regardless of scale
-        // — this is the one event we want the player to feel firmly.
-        dsTriggerWeapon( 'R2', 180, 230, 255 );
+        // Rev limiter: hard wall at trigger pos ~170/255 (~67 % pulled),
+        // snapping free at ~225. Full force always — this is the loud
+        // "shift NOW" signal.
+        dsTriggerWeapon( 'R2', 170, 225, 255 );
 
     } else if ( tcBumping ) {
 
-        // TC engage bump: firm resistance over the back half of the pull
-        // for ~200 ms after TC kicks in.
-        dsTriggerFeedback( 'R2', 60, Math.round( 200 * scale ) );
-
-    } else if ( rpmNorm <= 0.05 ) {
-
-        dsTriggerOff( 'R2' );
+        // TC engage burst: 12 Hz vibration from start-of-pull through
+        // the whole travel for ~220 ms after TC kicks in. The vibration
+        // is what tells the player it's a slip event vs. just heavy
+        // resistance.
+        dsTriggerVibration( 'R2', 10, 12, Math.round( 220 * scale ) );
 
     } else {
 
-        // Cruise resistance: starts at ~40/255 trigger pos (so light
-        // blips stay responsive), force climbs from 60 → 220 as RPM
-        // sweeps from idle to redline.
-        const f = Math.max( 40, Math.min( 220, Math.round( ( 60 + rpmNorm * 160 ) * scale ) ) );
-        dsTriggerFeedback( 'R2', 40, f );
+        // Cruise resistance: starts at ~30/255 trigger pos (so even
+        // a light tap loads immediately), force climbs from 50 → 230
+        // as load sweeps from idle to redline-at-full-throttle.
+        const f = Math.max( 50, Math.min( 230, Math.round( ( 50 + load * 180 ) * scale ) ) );
+        dsTriggerFeedback( 'R2', 30, f );
 
     }
 
-    // ---- L2 (brake) ------------------------------------------------------
+    // ---- L2 (brake) — Forza-style ---------------------------------------
+    // Forza behaviour:
+    //   * Pedal weight scales with brake input — light tap is light,
+    //     pinning the pedal is heavy.
+    //   * Trail-braking (steering AND braking) adds extra stiffness so
+    //     the player feels the load transfer to the front wheels.
+    //   * ABS engagement → fast vibration that pulses the pedal back at
+    //     the player, matching what real ABS feels like through a pedal.
+    //   * Off-track (no wheel contact on multiple wheels) adds a light
+    //     surface-texture vibration so the player feels they've left
+    //     the racing line.
     const brake = input.brake || 0;
-    if ( drivetrain.abs.engaged && brake > 0.15 ) {
+    const steerMag = Math.min( 1, Math.abs( input.steer || 0 ) );
+    let wheelsOff = 0;
+    if ( typeof vehicleController !== 'undefined' && vehicleController && typeof vehicleController.wheelIsInContact === 'function' ) {
 
-        // ABS pulse — 10 Hz vibration at decent force so it actually
-        // feels like the pedal pulsing back. Starts almost from the top
-        // of the pull (pos 30/255 ≈ 12 %).
-        dsTriggerVibration( 'L2', 30, 10, Math.round( 200 * scale ) );
+        for ( let i = 0; i < 4; i ++ ) {
+
+            if ( ! vehicleController.wheelIsInContact( i ) ) wheelsOff ++;
+
+        }
+
+    }
+    const offTrack = wheelsOff >= 3 && speed > 4;
+
+    if ( testActive ) {
+
+        // Debug override: ignore everything else, just hold the requested
+        // raw force on L2 so the player can confirm the protocol works.
+        dsTriggerFeedback( 'L2', 20, ds.testForceL2 | 0 );
+
+    } else if ( drivetrain.abs.engaged && brake > 0.15 ) {
+
+        // ABS pulse — 12 Hz vibration at near-max force so the pedal
+        // genuinely kicks back. Starts almost from the top of the pull
+        // (pos 20/255 ≈ 8 %) and the force scales with brake input so
+        // a light ABS event isn't as harsh as a full-pedal stop.
+        const absForce = Math.round( ( 180 + brake * 75 ) * scale );
+        dsTriggerVibration( 'L2', 20, 12, Math.max( 60, Math.min( 255, absForce ) ) );
 
     } else if ( brake > 0.02 ) {
 
-        // Pedal feel: light squeeze at low brake input, stiff at heavy
-        // brake. Native-protocol force range 60..240; trail-braking
-        // (steer + brake together) adds up to +60 more force so the
-        // pedal stiffens when leaning the car into a corner — the
-        // moment a real driver wants the most pedal feedback for
-        // weight-transfer feel.
-        const steerMag = Math.min( 1, Math.abs( input.steer || 0 ) );
-        const trailBonus = steerMag * brake * 60;
-        const target = 60 + brake * 180 + trailBonus; // 60..300 pre-clamp
-        const f = Math.max( 40, Math.min( 255, Math.round( target * scale ) ) );
-        // Start position 20/255 ≈ pull starts loading almost immediately.
+        // Pedal feel: progressive resistance, trail-braking bonus.
+        // Range 60..255 native; trail-brake stacks up to +70 on top of
+        // the brake-pressure ramp so the pedal stiffens noticeably when
+        // turning the wheel while braking.
+        const trailBonus = steerMag * brake * 70;
+        const target = 60 + brake * 200 + trailBonus; // 60..330 pre-clamp
+        const f = Math.max( 50, Math.min( 255, Math.round( target * scale ) ) );
         dsTriggerFeedback( 'L2', 20, f );
+
+    } else if ( offTrack ) {
+
+        // Surface texture: light vibration off-throttle, off-brake, off
+        // the track. Forza does something similar when you drop wheels
+        // off the kerb — feels like grass / gravel rumble through L2.
+        dsTriggerVibration( 'L2', 40, 8, Math.round( 90 * scale ) );
 
     } else if ( input.reverseEngaged ) {
 
