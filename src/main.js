@@ -1772,6 +1772,10 @@ class RemoteCar {
         this.snaps = [];                  // [{ time, pos, rot, vel }]
         this.group = new THREE.Group();
         this._buildVisual();
+        // Match the per-map car-visual scale so remote players look the same
+        // size as the local player (Spa / Suzuka run carScale 1.5×).
+        const ms = ( MAPS[ currentMapId ] && MAPS[ currentMapId ].carScale ) || 1;
+        this.group.scale.setScalar( ms );
         scene.add( this.group );
 
     }
@@ -2875,7 +2879,7 @@ const CONTROLS_KEYBOARD = [
     'L⇧ · upshift  ·  L⌃ · downshift',
     'R · reset',
     'C · cycle camera (chase / free / pov)',
-    '1 / 2 / 3 · cycle map (Nordschleife / GP / Spa)',
+    '1 / 2 / 3 / 4 · cycle map (Nordschleife / GP / Spa / Suzuka)',
     'B · toggle ABS    ·    N · toggle traction control',
     'T · record 60s telemetry (input + output → JSON)'
 ];
@@ -3574,6 +3578,19 @@ const MAPS = {
         dof: { focus: 30, aperture: 0.0000051, maxblur: 0.006 },
         carScale: 1.5
     },
+    suzuka: {
+        // Suzuka Circuit 2001 layout — community GLB (~95 MB) with
+        // embedded textures. Same optimisation profile as Spa: chunk
+        // culling + DoF + 1.5× car scale. Spawn pose will be updated
+        // after the user captures one with P on the main straight.
+        label: 'Suzuka Circuit (2001)',
+        path: 'textures/models/suzuka.glb',
+        spawnPos: { x: 502.49, y: - 7.05, z: 559.14 },
+        spawnRot: { x: 0.0165, y: - 0.0934, z: - 0.0017, w: 0.9955 },
+        renderRadius: 1500,
+        dof: { focus: 30, aperture: 0.0000051, maxblur: 0.006 },
+        carScale: 1.35
+    },
 };
 let currentMapId = 'nurburgring';
 let mapSwapInFlight = false;
@@ -3747,6 +3764,7 @@ async function init() {
         if ( k === '1' ) swapMap( 'nurburgring' );
         if ( k === '2' ) swapMap( 'nurburgring_gp' );
         if ( k === '3' ) swapMap( 'spa' );
+        if ( k === '4' ) swapMap( 'suzuka' );
         if ( k === 'F3' ) { event.preventDefault(); toggleStatsForNerds(); }
 
         if ( k === 'c' || k === 'C' ) cycleCameraMode();
@@ -3888,6 +3906,51 @@ async function initPhysics() {
     await loadTrack();
 
     createCar();
+
+    // Kick off background preloading of every other map's GLB after the
+    // initial map is fully driveable. THREE.Cache stores the raw GLB bytes,
+    // so when the player presses 2 / 3 / 4 the next loadAsync() reuses the
+    // cached buffer — the swap then pays only the parse + chunking cost
+    // (~hundreds of ms for big tracks) instead of the network download
+    // (5–30 s for the 50–95 MB community files).
+    preloadOtherMaps();
+
+}
+
+let _preloadStarted = false;
+function preloadOtherMaps() {
+
+    if ( _preloadStarted ) return;
+    _preloadStarted = true;
+    THREE.Cache.enabled = true;
+    // Defer so the initial frame, audio unlock, and any first-input physics
+    // tick all win the bandwidth race; preloading then chews quietly behind.
+    setTimeout( () => {
+
+        const loader = new GLTFLoader();
+        const others = Object.keys( MAPS ).filter( id => id !== currentMapId );
+        ( async () => {
+
+            for ( const id of others ) {
+
+                try {
+
+                    const url = import.meta.env.BASE_URL + MAPS[ id ].path;
+                    const t0 = performance.now();
+                    await loader.loadAsync( url );
+                    console.log( `[preload] cached ${ id } (${ ( ( performance.now() - t0 ) / 1000 ).toFixed( 1 ) } s)` );
+
+                } catch ( err ) {
+
+                    console.warn( `[preload] ${ id } failed:`, err.message );
+
+                }
+
+            }
+
+        } )();
+
+    }, 4000 );
 
 }
 
@@ -4248,6 +4311,19 @@ async function swapMap( id ) {
 
         const s = cfg.carScale || 1;
         car.scale.setScalar( s );
+
+    }
+
+    // 5c) Match remote cars to the same scale so other players in the
+    //     room look the same size as the local player on every map.
+    const remoteScale = cfg.carScale || 1;
+    if ( multiplayer && multiplayer.remotes ) {
+
+        for ( const rc of multiplayer.remotes.values() ) {
+
+            if ( rc.group ) rc.group.scale.setScalar( remoteScale );
+
+        }
 
     }
 
