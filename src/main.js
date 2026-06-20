@@ -1123,7 +1123,13 @@ async function dsFlush() {
     // LED brightness"). Without these enable bits the firmware ignores
     // entire blocks of the output report, including — surprise — the
     // adaptive-trigger block on some firmware versions.
-    common[ 1 ] = 0xF7;
+    // validFlag1 was 0xF7 (the reference's UI default); that enables the
+    // mic-LED, lightbar, player-indicator, etc. control fields, and
+    // because we send zeros for all of them every flush the controller
+    // re-applies an "all-off" LED state ~30 times per second → visible
+    // lightbar flicker. 0x00 means "don't touch any of those" — the
+    // controller keeps whatever LED state it had before we attached.
+    common[ 1 ] = 0x00;
     // Motor magnitudes (offset 2 / 3) stay 0 — rumbleTick() handles those
     // through navigator.getGamepads().vibrationActuator on a different code path.
     // R2 block starts at offset 10 (R2 mode at 10, R2 params 11..20).
@@ -1540,25 +1546,27 @@ function updateDualsense( speed ) {
 
     if ( rpm >= redline * 0.99 ) {
 
-        // Rev limiter: hard wall at trigger pos ~170/255 (~67 % pulled),
-        // snapping free at ~225. Full force always — this is the loud
-        // "shift NOW" signal.
-        dsTriggerWeapon( 'R2', 170, 225, 255 );
+        // Rev limiter: a noticeable wall but not a full lock. Reduced
+        // from full force 255 → 160 so the pedal still moves with effort.
+        dsTriggerWeapon( 'R2', 180, 220, 160 );
 
     } else if ( tcBumping ) {
 
-        // TC engage burst: 12 Hz vibration from start-of-pull through
-        // the whole travel for ~220 ms after TC kicks in. The vibration
-        // is what tells the player it's a slip event vs. just heavy
-        // resistance.
-        dsTriggerVibration( 'R2', 10, 12, Math.round( 220 * scale ) );
+        // TC engage burst: short 12 Hz vibration so the player notices
+        // a slip event without the controller fighting them.
+        dsTriggerVibration( 'R2', 30, 12, Math.round( 110 * scale ) );
+
+    } else if ( load <= 0.05 ) {
+
+        // Idle / coast — let the trigger be free so blips are responsive.
+        dsTriggerOff( 'R2' );
 
     } else {
 
-        // Cruise resistance: starts at ~30/255 trigger pos (so even
-        // a light tap loads immediately), force climbs from 50 → 230
-        // as load sweeps from idle to redline-at-full-throttle.
-        const f = Math.max( 50, Math.min( 230, Math.round( ( 50 + load * 180 ) * scale ) ) );
+        // Cruise resistance: gentle ramp 20→100 force. Was 50→230 which
+        // made the pedal physically hard to pull all the way to full
+        // throttle. Half that, capped well below max.
+        const f = Math.max( 20, Math.min( 110, Math.round( ( 20 + load * 80 ) * scale ) ) );
         dsTriggerFeedback( 'R2', 30, f );
 
     }
@@ -1596,35 +1604,34 @@ function updateDualsense( speed ) {
 
     } else if ( drivetrain.abs.engaged && brake > 0.15 ) {
 
-        // ABS pulse — 12 Hz vibration at near-max force so the pedal
-        // genuinely kicks back. Starts almost from the top of the pull
-        // (pos 20/255 ≈ 8 %) and the force scales with brake input so
-        // a light ABS event isn't as harsh as a full-pedal stop.
-        const absForce = Math.round( ( 180 + brake * 75 ) * scale );
-        dsTriggerVibration( 'L2', 20, 12, Math.max( 60, Math.min( 255, absForce ) ) );
+        // ABS pulse — 12 Hz vibration but at moderate force so the
+        // player still gets useful brake control. Was 180-255 (near
+        // max) which pinned the trigger and made trail-braking through
+        // ABS impossible.
+        const absForce = Math.round( ( 90 + brake * 40 ) * scale );
+        dsTriggerVibration( 'L2', 20, 12, Math.max( 40, Math.min( 140, absForce ) ) );
 
     } else if ( brake > 0.02 ) {
 
-        // Pedal feel: progressive resistance, trail-braking bonus.
-        // Range 60..255 native; trail-brake stacks up to +70 on top of
-        // the brake-pressure ramp so the pedal stiffens noticeably when
-        // turning the wheel while braking.
-        const trailBonus = steerMag * brake * 70;
-        const target = 60 + brake * 200 + trailBonus; // 60..330 pre-clamp
-        const f = Math.max( 50, Math.min( 255, Math.round( target * scale ) ) );
+        // Pedal feel: progressive but light. Range 20→120 + small trail
+        // brake bonus (up to +25). Previous 60→255 with +70 trail bonus
+        // pinned the trigger solid and the player couldn't modulate the
+        // brake — they want pedal *feel*, not a brick wall.
+        const trailBonus = steerMag * brake * 25;
+        const target = 20 + brake * 100 + trailBonus; // 20..145 pre-clamp
+        const f = Math.max( 15, Math.min( 150, Math.round( target * scale ) ) );
         dsTriggerFeedback( 'L2', 20, f );
 
     } else if ( offTrack ) {
 
-        // Surface texture: light vibration off-throttle, off-brake, off
-        // the track. Forza does something similar when you drop wheels
-        // off the kerb — feels like grass / gravel rumble through L2.
-        dsTriggerVibration( 'L2', 40, 8, Math.round( 90 * scale ) );
+        // Surface texture: very light vibration when wheels lift —
+        // information, not a wall.
+        dsTriggerVibration( 'L2', 40, 8, Math.round( 60 * scale ) );
 
     } else if ( input.reverseEngaged ) {
 
         // Light reverse-latched reminder.
-        dsTriggerFeedback( 'L2', 60, Math.round( 50 * scale ) );
+        dsTriggerFeedback( 'L2', 60, Math.round( 30 * scale ) );
 
     } else {
 
