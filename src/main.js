@@ -3598,7 +3598,13 @@ const MAPS = {
         spawnRot: { x: 0.0026, y: - 0.9995, z: - 0.0158, w: 0.0257 },
         renderRadius: 1500,
         dof: { focus: 30, aperture: 0.0000051, maxblur: 0.006 },
-        carScale: 0.945
+        carScale: 0.945,
+        // Junk meshes baked into the community GLB (debug cubes, leftover
+        // placeholders). Any mesh whose centre is within `radius` of one of
+        // these world-space points gets hidden + has no trimesh collider.
+        excludeMeshesNear: [
+            { x: - 135.47, y: 10.35, z: - 152.55, radius: 4 }
+        ]
     },
 };
 let currentMapId = 'nurburgring';
@@ -4164,6 +4170,9 @@ async function loadTrack() {
     scene.add( track );
     track.updateMatrixWorld( true );
 
+    const excludeList = mapCfg.excludeMeshesNear || [];
+    const _excludeCenter = new THREE.Vector3();
+
     track.traverse( ( obj ) => {
 
         if ( obj.isMesh ) {
@@ -4196,6 +4205,30 @@ async function loadTrack() {
 
             }
 
+            // Per-map junk-mesh exclusion: hide + skip-collider any mesh whose
+            // centre is within radius of a configured world-space point.
+            if ( excludeList.length > 0 && obj.geometry ) {
+
+                if ( ! obj.geometry.boundingBox ) obj.geometry.computeBoundingBox();
+                obj.geometry.boundingBox.getCenter( _excludeCenter );
+                _excludeCenter.applyMatrix4( obj.matrixWorld );
+                for ( const ex of excludeList ) {
+
+                    const dx = _excludeCenter.x - ex.x;
+                    const dy = _excludeCenter.y - ex.y;
+                    const dz = _excludeCenter.z - ex.z;
+                    if ( dx * dx + dy * dy + dz * dz <= ex.radius * ex.radius ) {
+
+                        obj.visible = false;
+                        obj.userData.excludedJunk = true;
+                        break;
+
+                    }
+
+                }
+
+            }
+
         }
 
     } );
@@ -4213,6 +4246,8 @@ async function loadTrack() {
         // Skip foliage billboards — they're alpha-cutout tree cards. Their
         // bounding quad has no business being a solid wall the car bounces off.
         if ( obj.userData.isFoliage ) return;
+        // Skip junk meshes excluded by map config.
+        if ( obj.userData.excludedJunk ) return;
 
         const geom = obj.geometry;
         const posAttr = geom.attributes.position;
