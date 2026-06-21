@@ -16,7 +16,7 @@ import { openRoom, generateRoomCode } from './lib/net.js';
 
 let camera, scene, renderer, stats;
 let physics, physicsHelper, controls;
-let car, chassis, wheels, vehicleController;
+let car, chassis, chassisCollider, wheels, vehicleController;
 let clock;
 let fpsLabel, posLabel;
 let lapTimer;
@@ -316,6 +316,19 @@ function applyCarConfig( car, skipVisuals ) {
 
     }
     
+
+    // Re-apply the chassis-collider material every car swap. Friction is
+    // the per-car value; restitution stays at 0 (cars scrape, never bounce
+    // — see the comment in createCar for the underlying gotcha with how
+    // addMesh stores the third arg). applyCarConfig runs before createCar
+    // on first init, in which case there's no collider yet — skip silently
+    // and the values will be set when createCar finishes.
+    if ( chassisCollider ) {
+
+        chassisCollider.setFriction( car.chassisFriction );
+        chassisCollider.setRestitution( 0.0 );
+
+    }
 
     // Per-wheel suspension + friction + connection-point Y. Wheels keep their
     // X/Z positions; we only retune what the wheel/spring does.
@@ -2209,6 +2222,44 @@ function toggleMinimap() {
 
 }
 
+// Add a coloured dot inside the minimap frame for a remote peer. The dot
+// is positioned each frame in renderMinimap() — here we just create the
+// DOM node and parent it to the minimap container. Hex color is the
+// already-hashed deterministic per-peer color so a friend looks the same
+// on the minimap as their ghost car in the world.
+function _addMinimapDot( peerId ) {
+
+    if ( ! minimap.containerEl || minimap.peerDots.has( peerId ) ) return;
+    const dot = document.createElement( 'div' );
+    const colorHex = '#' + ( _colorForPeer( peerId ).toString( 16 ).padStart( 6, '0' ) );
+    // Smaller than the local triangle, plain circle so it doesn't compete
+    // visually with "you are here". Hidden until the first snap arrives —
+    // renderMinimap toggles display each frame.
+    dot.style.cssText = [
+        'position:absolute', 'top:0', 'left:0',
+        'width:8px', 'height:8px',
+        'margin:-4px 0 0 -4px',
+        'border-radius:50%',
+        'background:' + colorHex,
+        'border:1px solid rgba(0,0,0,0.6)',
+        'box-shadow:0 0 4px rgba(0,0,0,0.5)',
+        'pointer-events:none',
+        'display:none'
+    ].join( ';' );
+    minimap.containerEl.appendChild( dot );
+    minimap.peerDots.set( peerId, { el: dot, color: colorHex } );
+
+}
+
+function _removeMinimapDot( peerId ) {
+
+    const entry = minimap.peerDots.get( peerId );
+    if ( ! entry ) return;
+    if ( entry.el && entry.el.parentNode ) entry.el.parentNode.removeChild( entry.el );
+    minimap.peerDots.delete( peerId );
+
+}
+
 const _miniForward = new THREE.Vector3();
 const _miniQuat = new THREE.Quaternion();
 
@@ -2237,6 +2288,102 @@ function renderMinimap() {
     scene.background = null;
     minimap.renderer.render( scene, minimap.camera );
     scene.background = bg;
+
+    // Per-peer dots. We do this in DOM (not in the 3D scene) so they stay
+    // crisp at any zoom and we can clamp to the edge of the minimap when
+    // the peer is beyond the visible 500m × 500m window.
+    _updateMinimapPeerDots();
+
+}
+
+// Project each remote car's world position into minimap-canvas pixels
+// using the same orthographic basis the minimap camera uses, then place
+// its DOM dot at that point. Off-screen dots clamp to the edge so distant
+// peers are still locatable.
+function _updateMinimapPeerDots() {
+
+    if ( minimap.peerDots.size === 0 ) return;
+    if ( ! car ) return;
+
+    // ortho frustum = ±250 m, canvas = 200 × 200 px (centred)
+    const HALF_METRES = 250;
+    const HALF_PX = 100;
+    const PAD = 6;          // keep edge-clamped dots fully visible inside the frame
+    const MIN_PX = PAD;
+    const MAX_PX = 2 * HALF_PX - PAD;
+    const M_TO_PX = HALF_PX / HALF_METRES;
+
+    // The minimap camera was already oriented in renderMinimap() above; reuse
+    // _miniForward (its planar XZ forward) to derive the screen basis.
+    const fx = _miniForward.x;
+    const fz = _miniForward.z;
+    // Three.js camera local axes with up=(fx,0,fz), view_dir=(0,-1,0):
+    //   right = up × (-view_dir) = (fx,0,fz) × (0,1,0) = (-fz, 0, fx)
+    // screen_x_metres = world_offset · camera_right, screen_y_metres = world_offset · camera_up.
+    const rx = - fz;
+    const rz = fx;
+
+    const carX = car.position.x;
+    const carZ = car.position.z;
+
+    for ( const [ peerId, entry ] of minimap.peerDots ) {
+
+        const rc = multiplayer.remotes.get( peerId );
+        // Hide if peer's visual hasn't received any snaps yet, or if the
+        // RemoteCar instance is gone (cleanup race) — we keep the dot
+        // element around so we don't churn DOM, just set display:none.
+        if ( ! rc || ! rc.group || ! rc.group.visible ) {
+
+            if ( entry.el.style.display !== 'none' ) entry.el.style.display = 'none';
+            continue;
+
+        }
+
+        const dx = rc.group.position.x - carX;
+        const dz = rc.group.position.z - carZ;
+        // Screen-right metres = offset · camera_right; screen-up metres = offset · camera_up.
+        const sRight = dx * rx + dz * rz;
+        const sUp = dx * fx + dz * fz;
+
+        // Decide whether this peer is inside the visible window.
+        const offscreen = ( Math.abs( sRight ) > HALF_METRES || Math.abs( sUp ) > HALF_METRES );
+
+        let px = HALF_PX + sRight * M_TO_PX;
+        let py = HALF_PX - sUp * M_TO_PX;   // DOM Y is inverted
+
+        if ( offscreen ) {
+
+            // Edge-clamp via uniform scale to the dominant axis so the dot
+            // sits on the rectangular boundary in the actual direction of
+            // the peer rather than getting smeared into a corner.
+            const ax = Math.abs( sRight );
+            const az = Math.abs( sUp );
+            const scale = HALF_METRES / Math.max( ax, az );
+            const cRight = sRight * scale;
+            const cUp = sUp * scale;
+            px = HALF_PX + cRight * M_TO_PX;
+            py = HALF_PX - cUp * M_TO_PX;
+
+        }
+
+        // Clamp inside the frame so the ±4px dot doesn't poke past the border.
+        if ( px < MIN_PX ) px = MIN_PX;
+        else if ( px > MAX_PX ) px = MAX_PX;
+        if ( py < MIN_PX ) py = MIN_PX;
+        else if ( py > MAX_PX ) py = MAX_PX;
+
+        // Visual cue for off-screen peers — slightly transparent so it's
+        // obvious the dot is "stuck to the edge" rather than at that exact
+        // map location.
+        const wantOpacity = offscreen ? '0.6' : '1';
+        if ( entry.el.style.opacity !== wantOpacity ) entry.el.style.opacity = wantOpacity;
+
+        if ( entry.el.style.display !== 'block' ) entry.el.style.display = 'block';
+        // transform is cheaper to update than left/top (no layout) — but
+        // we need top/left as the anchor; transform translates from there.
+        entry.el.style.transform = `translate(${ px }px, ${ py }px)`;
+
+    }
 
 }
 
@@ -2952,10 +3099,51 @@ class RemoteCar {
         const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased();
         bodyDesc.setTranslation( 0, - 10000, 0 ); // park far below world until first snap
         this.body = physics.world.createRigidBody( bodyDesc );
+        // Match the visual scale (carScale per map). Without this, Spa/Suzuka
+        // render remotes 1.5× but their collider stays 1× — the visual mesh
+        // visually overlaps deeply before physics reports contact, and the
+        // resulting penetration recovery launches the local car.
+        const s = ( MAPS[ currentMapId ] && MAPS[ currentMapId ].carScale ) || 1;
         // chassis box is 2 × 1 × 4 (full extents) → half-extents 1 / 0.5 / 2
-        const colliderDesc = RAPIER.ColliderDesc.cuboid( 1, 0.5, 2 );
+        const colliderDesc = RAPIER.ColliderDesc.cuboid( 1 * s, 0.5 * s, 2 * s );
+        // High friction + zero restitution = cars scrape and rub; they do
+        // NOT bounce off each other. Restitution 0 here is critical because
+        // the local chassis is created with restitution ≈ 1 (see CARS[i].
+        // chassisFriction being passed as restitution to addMesh) — Rapier
+        // uses the MAX of the two materials, so leaving this at default
+        // would amplify any contact into a launch.
+        colliderDesc.setFriction( 0.8 );
+        colliderDesc.setRestitution( 0.0 );
         this.collider = physics.world.createCollider( colliderDesc, this.body );
         this.collider.setEnabled( false );
+        this._colliderScale = s;
+        // Remember last commanded pose so we can detect huge jumps in
+        // update() and skip the velocity-synthesising kinematic API.
+        this._lastKinPos = null;
+
+    }
+
+    // Rebuilds the collider at the current map's carScale. Called from
+    // swapMap so the box stays sized to the visual mesh after a map swap.
+    rebuildPhysicsForMap() {
+
+        if ( ! physics || ! physics.RAPIER || ! physics.world || ! this.body ) return;
+        const s = ( MAPS[ currentMapId ] && MAPS[ currentMapId ].carScale ) || 1;
+        if ( s === this._colliderScale ) return;
+        const RAPIER = physics.RAPIER;
+        // Use our own ghost/solid flag rather than collider.isEnabled() —
+        // some Rapier builds don't expose isEnabled as a method on the
+        // collider, but _collidable is set by setCollidable so it's the
+        // canonical truth.
+        const wasEnabled = !! this._collidable;
+        if ( this.collider ) physics.world.removeCollider( this.collider, true );
+        const colliderDesc = RAPIER.ColliderDesc.cuboid( 1 * s, 0.5 * s, 2 * s );
+        colliderDesc.setFriction( 0.8 );
+        colliderDesc.setRestitution( 0.0 );
+        this.collider = physics.world.createCollider( colliderDesc, this.body );
+        this.collider.setEnabled( wasEnabled );
+        this._colliderScale = s;
+        this._lastKinPos = null;
 
     }
 
@@ -3105,8 +3293,47 @@ class RemoteCar {
 
             const p = this.group.position;
             const q = this.group.quaternion;
-            this.body.setNextKinematicTranslation( { x: p.x, y: p.y, z: p.z } );
-            this.body.setNextKinematicRotation( { x: q.x, y: q.y, z: q.z, w: q.w } );
+
+            // setNextKinematicTranslation synthesises a per-step velocity
+            // as (newPos - oldPos) / dt and slams that into anything it
+            // hits. A 50 ms snap gap with a 50 m/s car = ~2.5 m jump,
+            // which manifests as a 150 m/s phantom velocity that launches
+            // our dynamic chassis into the skybox. If the jump exceeds
+            // a sane threshold we teleport with setTranslation instead,
+            // which doesn't compute a velocity — the collider effectively
+            // appears at the new pose without smashing through us.
+            // 2 m/frame ≈ 120 m/s @ 60 fps, comfortably above any real
+            // speed the cars hit on these tracks.
+            const MAX_KIN_DELTA = 2;
+            const last = this._lastKinPos;
+            const jumped = ! last || (
+                Math.abs( p.x - last.x ) > MAX_KIN_DELTA ||
+                Math.abs( p.y - last.y ) > MAX_KIN_DELTA ||
+                Math.abs( p.z - last.z ) > MAX_KIN_DELTA
+            );
+
+            if ( jumped ) {
+
+                this.body.setTranslation( { x: p.x, y: p.y, z: p.z }, true );
+                this.body.setRotation( { x: q.x, y: q.y, z: q.z, w: q.w }, true );
+
+            } else {
+
+                this.body.setNextKinematicTranslation( { x: p.x, y: p.y, z: p.z } );
+                this.body.setNextKinematicRotation( { x: q.x, y: q.y, z: q.z, w: q.w } );
+
+            }
+
+            if ( ! this._lastKinPos ) this._lastKinPos = { x: 0, y: 0, z: 0 };
+            this._lastKinPos.x = p.x;
+            this._lastKinPos.y = p.y;
+            this._lastKinPos.z = p.z;
+
+        } else if ( this._lastKinPos ) {
+
+            // Reset tracking when collider is off so the next enable doesn't
+            // see a stale "huge jump" from where we were before going ghost.
+            this._lastKinPos = null;
 
         }
 
@@ -3190,12 +3417,16 @@ function _makeNameSprite( name ) {
 
 }
 
-// Spawn slot = where you land when you join a room. Slot 0 stays at
-// spawnPoint (the host); each subsequent slot shifts the local car one
-// car-width to the right (perpendicular to spawn-forward, ground plane).
+// Spawn slot = where you land in the start grid. Slot 0 sits at
+// spawnPoint; each subsequent slot shifts the local car one car-width
+// to the right (perpendicular to spawn-forward, ground plane). With the
+// deterministic sorted-ID slot system, ANY peer can land at slot 0 —
+// it goes to whoever's selfId sorts alphabetically first. So we apply
+// even slot=0 (a teleport-to-spawn) for symmetry; without it, a peer
+// who recomputes from non-zero back to 0 wouldn't actually move.
 function _applySpawnSlot( slot ) {
 
-    if ( ! chassis || slot <= 0 ) return;
+    if ( ! chassis || slot < 0 ) return;
 
     // Right vector = forward rotated 90° clockwise in the XZ plane.
     const fwdX = _lapFinishForward.x;
@@ -3218,6 +3449,37 @@ function _applySpawnSlot( slot ) {
 
 }
 
+// Deterministic spawn-slot assignment without any cross-peer coordination.
+// Every client sorts the set { selfId, ...peerIds } alphabetically and
+// finds its own index — that index is the same on every machine, so two
+// peers can never claim the same slot even if they joined within the
+// same tick. The original peer-count-based approach raced on join order
+// and could collapse two joiners onto identical slots.
+function _computeLocalSlot() {
+
+    if ( ! multiplayer.room ) return 0;
+    const selfId = multiplayer.room.selfId;
+    if ( ! selfId ) return 0;
+    const ids = multiplayer.room.peers().slice();
+    ids.push( selfId );
+    ids.sort();
+    const idx = ids.indexOf( selfId );
+    return idx < 0 ? 0 : idx;
+
+}
+
+// Only safe to teleport the local car during pre-race states — moving
+// someone mid-race would feel awful and break their physics state.
+// Lobby + ready_check are the windows where spawn re-shuffles are OK.
+function _reapplyLocalSlotIfSafe() {
+
+    if ( ! multiplayer.room ) return;
+    const s = multiplayer.raceState;
+    if ( s !== 'lobby' && s !== 'ready_check' ) return;
+    _applySpawnSlot( _computeLocalSlot() );
+
+}
+
 function _hookRoomCallbacks( room ) {
 
     room.on( 'peerJoin', ( peerId ) => {
@@ -3233,6 +3495,12 @@ function _hookRoomCallbacks( room ) {
 
         }
         _renderMultiplayerUI();
+        // Re-shuffle the local spawn slot deterministically every time the
+        // peer set changes (but only while pre-race). Without this, a player
+        // who joined early could end up sandwiched once more peers arrive.
+        _reapplyLocalSlotIfSafe();
+        // Add minimap dot for the newly-known peer.
+        _addMinimapDot( peerId );
 
     } );
 
@@ -3243,7 +3511,10 @@ function _hookRoomCallbacks( room ) {
         multiplayer.remotes.delete( peerId );
         multiplayer.metaByPeer.delete( peerId );
         multiplayer.readyMap.delete( peerId );
+        _removeMinimapDot( peerId );
         _renderMultiplayerUI();
+        // Re-shuffle slots so departing peers don't leave gaps in the grid.
+        _reapplyLocalSlotIfSafe();
         // If their leaving means the remaining players are all ready, kick
         // off the countdown — otherwise the race stalls forever.
         _maybeStartCountdown();
@@ -3259,6 +3530,8 @@ function _hookRoomCallbacks( room ) {
             rc = new RemoteCar( peerId, data );
             rc.setCollidable( _isCollidableRaceState() );
             multiplayer.remotes.set( peerId, rc );
+            // Meta-before-peerJoin race: ensure the minimap dot exists.
+            _addMinimapDot( peerId );
 
         } else {
 
@@ -3290,6 +3563,8 @@ function _hookRoomCallbacks( room ) {
             rc = new RemoteCar( peerId, multiplayer.metaByPeer.get( peerId ) );
             rc.setCollidable( _isCollidableRaceState() );
             multiplayer.remotes.set( peerId, rc );
+            // Snapshot-before-peerJoin race: ensure the minimap dot exists.
+            _addMinimapDot( peerId );
             _renderMultiplayerUI();
 
         }
@@ -3815,18 +4090,19 @@ function _enterRoom( code, isHost ) {
     _hookRoomCallbacks( room );
     _setUrlForRoom( code );
 
-    // Joining? Wait a tick so peer-count is meaningful, then take a slot
-    // beside the existing players. Hosts always stay in slot 0.
-    if ( ! isHost ) {
+    // Take a slot beside any peers already present. Slot is computed
+    // deterministically by sorting peerIds + selfId — every machine
+    // produces the same mapping, so no coordination is needed and
+    // simultaneous joiners can't collide on the same slot. We still wait
+    // ~300ms because room.peers() is empty on the very first tick after
+    // openRoom; the peerJoin handler will also fire _reapplyLocalSlotIfSafe
+    // when new peers show up, so this initial call is just for the case
+    // where peers were already in the room when we arrived.
+    setTimeout( () => {
 
-        setTimeout( () => {
+        _reapplyLocalSlotIfSafe();
 
-            const peerCount = room.peers().length;
-            _applySpawnSlot( peerCount );
-
-        }, 300 );
-
-    }
+    }, 300 );
 
     _renderMultiplayerUI();
 
@@ -3849,6 +4125,13 @@ function _leaveRoom() {
     multiplayer.raceWinner = null;
     multiplayer.raceWinnerName = '';
     multiplayer.isHost = false;
+    // Tear down every per-peer minimap dot — otherwise stale dots would
+    // hang around in the frame after we leave.
+    for ( const peerId of Array.from( minimap.peerDots.keys() ) ) {
+
+        _removeMinimapDot( peerId );
+
+    }
     _setUrlForRoom( null );
     _renderMultiplayerUI();
 
@@ -4818,7 +5101,10 @@ const minimap = {
     renderer: null,
     camera: null,
     toggleBtn: null,
-    marker: null
+    marker: null,
+    // DOM dot per remote peer, positioned each frame in renderMinimap().
+    // Map peerId -> { el, color }. Created in peerJoin / removed in peerLeave.
+    peerDots: new Map()
 };
 
 // Gamepad state — populated each frame in pollGamepad if one is plugged in.
@@ -5760,12 +6046,17 @@ async function swapMap( id ) {
 
     // 5c) Match remote cars to the same scale so other players in the
     //     room look the same size as the local player on every map.
+    //     Also rebuild each remote's Rapier collider at the new scale —
+    //     otherwise the visual mesh grows to 1.5× on Spa/Suzuka but the
+    //     collider stays 1×, causing massive penetration on contact and
+    //     a violent launch-to-space recovery.
     const remoteScale = cfg.carScale || 1;
     if ( multiplayer && multiplayer.remotes ) {
 
         for ( const rc of multiplayer.remotes.values() ) {
 
             if ( rc.group ) rc.group.scale.setScalar( remoteScale );
+            if ( typeof rc.rebuildPhysicsForMap === 'function' ) rc.rebuildPhysicsForMap();
 
         }
 
@@ -5821,6 +6112,21 @@ function createCar() {
     physics.addMesh( mesh, baselineMass, currentCar.chassisFriction );
     chassis = mesh.userData.physics.body;
     chassis.setRotation( new physics.RAPIER.Quaternion( spawnQuaternion.x, spawnQuaternion.y, spawnQuaternion.z, spawnQuaternion.w ), true );
+
+    // The shared RapierPhysics helper takes its third arg as "restitution"
+    // even though our CARS data labels it chassisFriction — so a 0.9-1.0
+    // value was being set as restitution, which made the chassis act like
+    // a beach ball when contacted by a remote car (Rapier picks MAX of the
+    // two restitutions at a contact). Re-apply the intended meaning: use
+    // the value as friction, zero out restitution. Cars scrape instead of
+    // ping off each other, and remote-car contact stops launching us.
+    chassisCollider = mesh.userData.physics.collider;
+    if ( chassisCollider ) {
+
+        chassisCollider.setFriction( currentCar.chassisFriction );
+        chassisCollider.setRestitution( 0.0 );
+
+    }
 
     carVisualsGroup = new THREE.Group();
     mesh.add( carVisualsGroup );
