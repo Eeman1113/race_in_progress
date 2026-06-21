@@ -956,12 +956,15 @@ const ds = {
         L2: { mode: 0xFF, p: [ - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1 ] },
         R2: { mode: 0xFF, p: [ - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1 ] }
     },
+    // In-flight guard so a rapid double-click on the toggle button can't
+    // race the picker / attach / detach lifecycle (which is fully async).
+    // Without this, clicking again while a detach is awaiting close()
+    // would slip into the else-branch and re-open the picker mid-tear-down.
+    toggleInFlight: false,
     // Edge-tracking for the mapper.
     prevTcEngaged: false,
     tcBumpUntil: 0,           // R2 wheelspin/TC vibration end time (ms)
-    prevAbsEngaged: false,
     absPulseUntil: 0,         // L2 ABS pulse hold end time (ms)
-    prevOffTrack: false,
     // Edge timers + last-mode tracking for the racing-feel mapper below.
     revLimitUntil: 0,         // R2 rev-limiter buzz end time (ms)
     revLimitCooldownUntil: 0, // earliest time a new rev-limit buzz may fire
@@ -969,9 +972,14 @@ const ds = {
     shiftTickUntil: 0,        // R2 paddle-shift detent end time (ms)
     tcCooldownUntil: 0,       // earliest time wheelspin buzz may re-arm
     kerbHitUntil: 0,          // L2 kerb-impact bump end time (ms)
-    prevLatSlip: false,       // last frame's lateral-slip-active flag
+    hardLandUntil: 0,         // L2 bottom-out thump end time (ms)
+    prevLatSlip: false,       // last frame's lateral-slip-active flag (raw, no brake gate)
     latSlipUntil: 0,          // R2 lateral-slide buzz end time (ms)
     latSlipCooldownUntil: 0,  // earliest time slide buzz may re-arm
+    prevReverseEngaged: false,// edge-detect reverse-gear engagement
+    reverseTickUntil: 0,      // R2 reverse-engaged snap end time (ms)
+    prevHandbrakeOn: false,   // edge-detect handbrake at speed
+    handbrakeTickUntil: 0,    // R2 handbrake-yank end time (ms)
     prevSusp: [ 0, 0, 0, 0 ]  // per-wheel suspension force last frame
 };
 
@@ -1065,10 +1073,10 @@ function dsTriggerOff( side ) { _dsSetTrigger( side, 0x00, [ 0, 0, 0, 0, 0, 0, 0
 function resetDualsenseState() {
 
     ds.prevTcEngaged = false;
-    ds.prevAbsEngaged = false;
-    ds.prevOffTrack = false;
     ds.prevShiftCd = 0;
     ds.prevLatSlip = false;
+    ds.prevReverseEngaged = false;
+    ds.prevHandbrakeOn = false;
     ds.prevSusp[ 0 ] = 0;
     ds.prevSusp[ 1 ] = 0;
     ds.prevSusp[ 2 ] = 0;
@@ -1080,8 +1088,11 @@ function resetDualsenseState() {
     ds.revLimitCooldownUntil = 0;
     ds.shiftTickUntil = 0;
     ds.kerbHitUntil = 0;
+    ds.hardLandUntil = 0;
     ds.latSlipUntil = 0;
     ds.latSlipCooldownUntil = 0;
+    ds.reverseTickUntil = 0;
+    ds.handbrakeTickUntil = 0;
     dsTriggerOff( 'L2' );
     dsTriggerOff( 'R2' );
 
@@ -1355,30 +1366,18 @@ let _dsButtonEl = null;
 function _dsUpdateButton() {
 
     if ( ! _dsButtonEl ) return;
-    if ( ds.device && ds.device.opened ) {
-
-        // Click in this state calls _dsDetach() — see the click handler
-        // in initDualsenseButton. Stays enabled so the player can turn
-        // it off without unplugging the controller.
-        _dsButtonEl.textContent = '✓ triggers on';
-        _dsButtonEl.style.opacity = '1';
-        _dsButtonEl.disabled = false;
-        _dsButtonEl.style.display = '';
-
-    } else if ( _dsGamepadLooksLikeDualSense() && 'hid' in navigator ) {
-
-        _dsButtonEl.textContent = '+ adaptive triggers';
-        _dsButtonEl.style.opacity = '1';
-        _dsButtonEl.disabled = false;
-        _dsButtonEl.style.display = '';
-
-    } else {
-
-        // No DualSense in sight — keep the row hidden so non-PS players
-        // don't see a useless button.
-        _dsButtonEl.style.display = 'none';
-
-    }
+    // Two states only: "adaptive triggers: on" when a device is open and
+    // claimed, "adaptive triggers: off" otherwise. Always visible when the
+    // browser supports WebHID — if the player has no DualSense, clicking
+    // pops the picker which will show an empty list and they can dismiss.
+    // (Earlier versions hid the row when no DS gamepad was polled, but
+    // gamepad-index detection is flaky and the user was clicking on a
+    // transiently-hidden button getting no response.)
+    const on = !!( ds.device && ds.device.opened );
+    _dsButtonEl.textContent = on ? 'adaptive triggers: on' : 'adaptive triggers: off';
+    _dsButtonEl.style.opacity = ds.toggleInFlight ? '0.5' : '1';
+    _dsButtonEl.disabled = !!ds.toggleInFlight;
+    _dsButtonEl.style.display = '';
     // Adding/removing this row changes #info's height, which would
     // otherwise leave the "stats for nerds" toggle button overlapping
     // the bottom of the cheatsheet.
@@ -1398,7 +1397,7 @@ function initDualsenseButton() {
 
     const btn = document.createElement( 'button' );
     btn.type = 'button';
-    btn.textContent = '+ adaptive triggers';
+    btn.textContent = 'adaptive triggers: off';
     btn.style.cssText = [
         'background: rgba(255,255,255,0.08)',
         'color: #FFCB47',
@@ -1410,28 +1409,43 @@ function initDualsenseButton() {
         'cursor: pointer',
         'pointer-events: auto'
     ].join( ';' );
-    btn.style.display = 'none'; // shown by _dsUpdateButton when DS pad seen
+    // Visible by default whenever WebHID is supported (we already early-return
+    // in initDualsenseButton if `hid` not in navigator). Previously hidden when
+    // no DS gamepad was polled, but that produced "I click and nothing happens"
+    // bugs when the gamepad index transiently dropped between polls.
 
     btn.addEventListener( 'click', async () => {
 
-        // Toggle: if a device is already open, the click is a request
-        // to turn triggers OFF (forces flush + closes the HID handle +
-        // clears the persisted authorization). Otherwise it pops the
-        // device picker.
-        if ( ds.device && ds.device.opened ) {
-
-            await _dsDetach();
-            return;
-
-        }
+        // In-flight guard: requestDevice / open / close are all async, and a
+        // rapid double-click would race the lifecycle. If a toggle is already
+        // running, ignore this click — the button is also visually disabled
+        // (opacity 0.5 + disabled attribute) via _dsUpdateButton.
+        if ( ds.toggleInFlight ) return;
+        ds.toggleInFlight = true;
+        _dsUpdateButton();
         try {
 
-            const devices = await navigator.hid.requestDevice( { filters: DS_FILTERS } );
-            if ( devices && devices[ 0 ] ) await _dsAttach( devices[ 0 ] );
+            if ( ds.device && ds.device.opened ) {
+
+                // ON → OFF: flush triggers free, close HID, clear localStorage.
+                await _dsDetach();
+
+            } else {
+
+                // OFF → ON: pop picker, attach the first picked device.
+                const devices = await navigator.hid.requestDevice( { filters: DS_FILTERS } );
+                if ( devices && devices[ 0 ] ) await _dsAttach( devices[ 0 ] );
+
+            }
 
         } catch ( err ) {
 
-            console.warn( '[dualsense] picker failed:', err?.message || err );
+            console.warn( '[dualsense] toggle failed:', err?.message || err );
+
+        } finally {
+
+            ds.toggleInFlight = false;
+            _dsUpdateButton();
 
         }
 
@@ -1511,12 +1525,17 @@ function initDualsenseButton() {
 // can't silently brick the trigger feedback).
 const DS_DEFAULT_PROFILE = {
     revLimit:      { forceMin: 90, forceMax: 130, freq: 14, startPos: 60,  holdMs: 250, cooldownMs: 400 },
-    shiftTick:     { forceMin: 45, forceMax: 90,  startPos: 130, holdMs: 70 },
+    shiftTick:     { forceMin: 45, forceMax:  90, startPos: 130, holdMs: 70 },
     wheelspin:     { forceMin: 60, forceMax: 100, freq: 12, startPos: 100, holdMs: 220, cooldownMs: 700, slipThreshold: 0.35 },
-    slide:         { forceMin: 35, forceMax: 70,  freq:  8, startPos: 80,  holdMs: 220, cooldownMs: 900, slipThreshold: 0.40, speedKmhMin: 22 },
+    slide:         { forceMin: 35, forceMax:  70, freq:  8, startPos: 80,  holdMs: 220, cooldownMs: 900, slipThreshold: 0.40, speedKmhMin: 22 },
     abs:           { forceMin: 70, forceMax: 110, freq: 12, startPos: 25,  holdMs: 100, brakeThreshold: 0.30 },
     kerb:          { forceMin: 60, forceMax: 110, startPos: 60,  holdMs: 120, suspThreshold: 20000 },
-    brakePressure: { forceMin: 25, forceMax: 100, startPos: 80,  deadzone: 0.55, ramp: 200, trailBonus: 35 }
+    brakePressure: { forceMin: 25, forceMax: 100, startPos: 80,  deadzone: 0.55, ramp: 200, trailBonus: 35 },
+    // Cues added after per-car profiles were authored. Cars can override
+    // these later; for now every car uses the defaults via the `cue()` helper.
+    reverse:       { forceMin: 60, forceMax:  90,            startPos: 50,  holdMs: 200 },
+    hardLand:      { forceMin: 95, forceMax: 130,            startPos: 50,  holdMs: 200 },
+    handbrake:     { forceMin: 60, forceMax:  95, freq: 10,  startPos: 80,  holdMs: 180 }
 };
 
 function updateDualsense( speed ) {
@@ -1533,6 +1552,33 @@ function updateDualsense( speed ) {
     const scale = Math.min( 1.5, rumble.strength * 1.5 );
     const now = performance.now();
     const prof = ( currentCar && currentCar.dsProfile ) || DS_DEFAULT_PROFILE;
+    // Per-cue fallback: a car can ship without a key and inherit the default.
+    // New cues (reverse / hardLand / handbrake) aren't customized per-car yet
+    // so they always read from DS_DEFAULT_PROFILE in practice.
+    const cue = ( name ) => prof[ name ] || DS_DEFAULT_PROFILE[ name ];
+
+    // RUM=0 (or near-0) — short-circuit BEFORE arming any cues. If we let the
+    // arming code run and then bailed out at render time, the *Until timers
+    // would persist; the moment the player nudges RUM back up they'd get a
+    // burst of stale cues that "happened" while muted. Clearing here keeps
+    // the channel honest: silent really means silent.
+    if ( scale < 0.05 ) {
+
+        ds.tcBumpUntil = 0;
+        ds.shiftTickUntil = 0;
+        ds.latSlipUntil = 0;
+        ds.revLimitUntil = 0;
+        ds.kerbHitUntil = 0;
+        ds.hardLandUntil = 0;
+        ds.absPulseUntil = 0;
+        ds.reverseTickUntil = 0;
+        ds.handbrakeTickUntil = 0;
+        dsTriggerOff( 'L2' );
+        dsTriggerOff( 'R2' );
+        dsFlush();
+        return;
+
+    }
 
     // Midpoint × master scale, clamped to per-cue [forceMin, forceMax].
     // The clamp is load-bearing: it enforces the per-car force ceiling so a
@@ -1596,16 +1642,29 @@ function updateDualsense( speed ) {
         ds.prevSusp[ i ] = susp;
 
     }
+    // Kerb hit at the profile threshold; HARD LANDING when the spike is
+    // ≥2.5× the threshold (genuine bottom-out from a jump or curb-launch
+    // landing). Hard-landing has its own *Until timer + L2 priority slot so
+    // it punches through ambient kerb chatter and feels like an impact.
     if ( kerbSpike > prof.kerb.suspThreshold ) ds.kerbHitUntil = Math.max( ds.kerbHitUntil, now + prof.kerb.holdMs );
+    if ( kerbSpike > prof.kerb.suspThreshold * 2.5 ) ds.hardLandUntil = Math.max( ds.hardLandUntil, now + cue( 'hardLand' ).holdMs );
 
     // Wheelspin event — TC engaged OR a driven tyre past per-car slip threshold.
-    // Re-arm cooldown stops slip-ratio bobbing around the threshold from
-    // refiring the cue every frame.
+    // Two arming paths so a sustained burnout doesn't go silent after holdMs:
+    //   1. Rising edge with cooldown elapsed → fresh long cue
+    //   2. Sustained continuous engagement → 80 ms rolling refresh keeps the
+    //      buzz alive the whole time the tyres are actually scrabbling. The
+    //      cooldown rule only applies to the rising edge; it exists to defeat
+    //      threshold-bobbing flicker, not to silence sustained spin.
     const wheelspin = drivetrain.tc.engaged || maxDriveSlip > prof.wheelspin.slipThreshold;
     if ( wheelspin && ! ds.prevTcEngaged && now >= ds.tcCooldownUntil ) {
 
         ds.tcBumpUntil = now + prof.wheelspin.holdMs;
         ds.tcCooldownUntil = now + prof.wheelspin.cooldownMs;
+
+    } else if ( wheelspin && ds.prevTcEngaged ) {
+
+        ds.tcBumpUntil = Math.max( ds.tcBumpUntil, now + 80 );
 
     }
     ds.prevTcEngaged = wheelspin;
@@ -1613,7 +1672,6 @@ function updateDualsense( speed ) {
     // ABS active — hold the cue past release so it doesn't flicker as
     // ABS modulates internally. Per-car holdMs (F1 60 ms crisp, Hatchback 110 ms).
     if ( drivetrain.abs.engaged ) ds.absPulseUntil = now + prof.abs.holdMs;
-    ds.prevAbsEngaged = drivetrain.abs.engaged;
 
     // Rev limiter — per-car buzz/hold/cooldown. Cooldown ensures holding
     // throttle at redline doesn't refire every frame.
@@ -1629,31 +1687,38 @@ function updateDualsense( speed ) {
     if ( shiftCd > 0 && ds.prevShiftCd <= 0 ) ds.shiftTickUntil = now + prof.shiftTick.holdMs;
     ds.prevShiftCd = shiftCd;
 
-    // Lateral chassis slide — per-car threshold + speed gate; gated off
-    // under braking so L2 cues (ABS / pedal feel) own that channel cleanly.
-    const lateralSliding = maxLatSlip > prof.slide.slipThreshold
-        && speedKmh > prof.slide.speedKmhMin
-        && brake < 0.3;
-    if ( lateralSliding && ! ds.prevLatSlip && now >= ds.latSlipCooldownUntil ) {
+    // Reverse-engaged snap — confirmation tactile when the player slots into
+    // reverse (rising edge of input.reverseEngaged).
+    if ( input.reverseEngaged && ! ds.prevReverseEngaged ) ds.reverseTickUntil = now + cue( 'reverse' ).holdMs;
+    ds.prevReverseEngaged = !! input.reverseEngaged;
+
+    // Handbrake-at-speed yank — rising edge of pulling the e-brake while
+    // actually moving. Quiet at parking-lot speeds, sharp on track.
+    const handbrakeActive = ( input.handbrake || 0 ) > 0.5 && speedKmh > 40;
+    if ( handbrakeActive && ! ds.prevHandbrakeOn ) ds.handbrakeTickUntil = now + cue( 'handbrake' ).holdMs;
+    ds.prevHandbrakeOn = handbrakeActive;
+
+    // Lateral chassis slide — track the RAW slide state (ignoring brake) so
+    // releasing brake mid-corner doesn't spuriously refire the cue. The brake
+    // gate is applied only at render time (slide cue is silent while braking
+    // because L2 owns those channels via ABS / pedal feel).
+    const slidingNow = maxLatSlip > prof.slide.slipThreshold && speedKmh > prof.slide.speedKmhMin;
+    if ( slidingNow && ! ds.prevLatSlip && now >= ds.latSlipCooldownUntil ) {
 
         ds.latSlipUntil = now + prof.slide.holdMs;
         ds.latSlipCooldownUntil = now + prof.slide.cooldownMs;
 
-    }
-    ds.prevLatSlip = lateralSliding;
+    } else if ( slidingNow && ds.prevLatSlip ) {
 
-    if ( scale < 0.05 ) {
-
-        dsTriggerOff( 'L2' );
-        dsTriggerOff( 'R2' );
-        dsFlush();
-        return;
+        ds.latSlipUntil = Math.max( ds.latSlipUntil, now + 80 );
 
     }
+    ds.prevLatSlip = slidingNow;
 
-    // ===== R2 priority chain: rev > shift > wheelspin > slide =====
-    // shift-tick sits above ambient cues so a deliberate driver action
-    // (gear change) is never masked by ambient wheelspin/slide buzz.
+    // ===== R2 priority chain =====
+    //   rev > shift > reverse > handbrake > wheelspin > slide
+    // Deliberate driver actions (shift/reverse/handbrake) sit above ambient
+    // cues (wheelspin/slide) so they're never masked by ambient buzz.
     if ( now < ds.revLimitUntil ) {
 
         const p = prof.revLimit;
@@ -1664,13 +1729,26 @@ function updateDualsense( speed ) {
         const p = prof.shiftTick;
         dsTriggerFeedback( 'R2', p.startPos, _f( p ) );
 
+    } else if ( now < ds.reverseTickUntil ) {
+
+        const p = cue( 'reverse' );
+        dsTriggerFeedback( 'R2', p.startPos, _f( p ) );
+
+    } else if ( now < ds.handbrakeTickUntil ) {
+
+        const p = cue( 'handbrake' );
+        dsTriggerVibration( 'R2', p.startPos, p.freq, _f( p ) );
+
     } else if ( now < ds.tcBumpUntil ) {
 
         const p = prof.wheelspin;
         dsTriggerVibration( 'R2', p.startPos, p.freq, _f( p ) );
 
-    } else if ( now < ds.latSlipUntil ) {
+    } else if ( now < ds.latSlipUntil && brake < 0.3 ) {
 
+        // Slide render still gates on brake-off — L2 owns those channels
+        // (ABS / pedal feel) when braking. The arming side ignores brake to
+        // avoid spurious refire when the player releases mid-corner.
         const p = prof.slide;
         dsTriggerVibration( 'R2', p.startPos, p.freq, _f( p ) );
 
@@ -1680,14 +1758,22 @@ function updateDualsense( speed ) {
 
     }
 
-    // ===== L2 priority chain: ABS > kerb > brake-pressure =====
-    if ( now < ds.absPulseUntil && brake > prof.abs.brakeThreshold ) {
+    // ===== L2 priority chain =====
+    //   ABS > hardLand > kerb > brake-pressure
+    // Hard-landing inserts above ambient kerb chatter so a jump-out impact
+    // punches through. ABS gate intentionally dropped from the render
+    // condition so light-pedal lockups (wet/ice) still produce the pedal
+    // tag-back — the per-car brakeThreshold is only used to scale the ramp.
+    if ( now < ds.absPulseUntil ) {
 
-        // ABS pulse force scales with brake input above the threshold.
-        // Real brake pedals do this exact thing during ABS modulation.
         const p = prof.abs;
-        const t = ( brake - p.brakeThreshold ) / Math.max( 0.001, 1 - p.brakeThreshold );
+        const t = Math.max( 0, ( brake - p.brakeThreshold ) / Math.max( 0.001, 1 - p.brakeThreshold ) );
         dsTriggerVibration( 'L2', p.startPos, p.freq, _fRamp( p, t ) );
+
+    } else if ( now < ds.hardLandUntil ) {
+
+        const p = cue( 'hardLand' );
+        dsTriggerFeedback( 'L2', p.startPos, _f( p ) );
 
     } else if ( now < ds.kerbHitUntil ) {
 
@@ -4524,15 +4610,17 @@ const CARS = [
         // Gravel-spec all-rounder: AWD wheelspin is brief 11 Hz "all-four
         // clawing" texture starting at low startPos (felt across pull), slide
         // is the signature (early threshold 0.32 + long 280 ms hold for Scandi
-        // flicks), long-travel suspension absorbs kerbs (26 kN threshold),
-        // gritty 9 Hz ABS like brakes fighting loose surface, strong trail bonus.
+        // flicks), longest-travel suspension absorbs kerbs (32 kN threshold —
+        // higher than Hatchback's 26 kN because Rally has 0.48 restLength
+        // vs Hatchback's 0.42, genuinely soaks more), gritty 9 Hz ABS like
+        // brakes fighting loose surface, strong trail bonus.
         dsProfile: {
             revLimit:      { forceMin: 85, forceMax: 120, freq: 12, startPos: 55,  holdMs: 280, cooldownMs: 420 },
             shiftTick:     { forceMin: 55, forceMax:  95, startPos: 125, holdMs: 85 },
             wheelspin:     { forceMin: 60, forceMax:  95, freq: 11, startPos: 55,  holdMs: 160, cooldownMs: 850, slipThreshold: 0.32 },
             slide:         { forceMin: 45, forceMax:  75, freq:  7, startPos: 65,  holdMs: 280, cooldownMs: 700, slipThreshold: 0.32, speedKmhMin: 20 },
             abs:           { forceMin: 65, forceMax: 105, freq:  9, startPos: 30,  holdMs: 120, brakeThreshold: 0.28 },
-            kerb:          { forceMin: 55, forceMax:  95, startPos: 65,  holdMs: 85,  suspThreshold: 26000 },
+            kerb:          { forceMin: 55, forceMax:  95, startPos: 65,  holdMs: 85,  suspThreshold: 32000 },
             brakePressure: { forceMin: 22, forceMax:  90, startPos: 85,  deadzone: 0.50, ramp: 180, trailBonus: 42 }
         }
     },
@@ -4600,18 +4688,22 @@ const CARS = [
         Cd: 0.0190, Cl: 0.0420,
         driveType: 'RWD',
         // Knife-edge: 15 Hz 17,500 rpm electronic scream (protocol-capped),
-        // seamless paddle = near-invisible 35 ms blip at deepest startPos
+        // revLimit cooldown 220 ms tucks just under the 200 ms hold so a held
+        // redline scream reads as continuous rather than 1.8 Hz on/off pattern.
+        // Seamless paddle = near-invisible 35 ms blip at deepest startPos
         // (200), spool diff fires wheelspin at low 0.22 slip (instant on/off),
-        // fast 10 Hz slide cue with low 0.30 threshold (milliseconds to react),
-        // brutal kerbs through 22 mm travel (8 kN threshold), ferocious 15 Hz
-        // ABS at 70 ms, brake bites at 40% deadzone with tall ramp.
+        // fast 11 Hz slide cue with low 0.30 threshold (milliseconds to react),
+        // sharp kerbs through 22 mm travel (22 kN threshold — bumped from 8 kN
+        // which was false-firing on any moderate compression in our physics,
+        // hard-landing cue covers genuine bottom-outs separately), ferocious
+        // 15 Hz ABS at 70 ms, brake bites at 40% deadzone with tall ramp.
         dsProfile: {
-            revLimit:      { forceMin: 90, forceMax: 125, freq: 15, startPos: 70,  holdMs: 200, cooldownMs: 350 },
+            revLimit:      { forceMin: 90, forceMax: 125, freq: 15, startPos: 70,  holdMs: 200, cooldownMs: 220 },
             shiftTick:     { forceMin: 40, forceMax:  60, startPos: 200, holdMs: 35 },
             wheelspin:     { forceMin: 60, forceMax:  95, freq: 13, startPos: 120, holdMs: 160, cooldownMs: 550, slipThreshold: 0.22 },
             slide:         { forceMin: 45, forceMax:  75, freq: 11, startPos: 90,  holdMs: 170, cooldownMs: 550, slipThreshold: 0.30, speedKmhMin: 30 },
             abs:           { forceMin: 75, forceMax: 110, freq: 15, startPos: 30,  holdMs: 70,  brakeThreshold: 0.25 },
-            kerb:          { forceMin: 70, forceMax: 120, startPos: 70,  holdMs: 90,  suspThreshold: 8000 },
+            kerb:          { forceMin: 70, forceMax: 120, startPos: 70,  holdMs: 90,  suspThreshold: 22000 },
             brakePressure: { forceMin: 30, forceMax: 100, startPos: 90,  deadzone: 0.40, ramp: 200, trailBonus: 25 }
         }
     },
