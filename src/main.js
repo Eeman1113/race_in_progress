@@ -381,6 +381,7 @@ function cycleCar( direction ) {
     resetTires();         // fresh tires on each car
     resetDrivetrain();    // engine starts at the new car's idle, clutch closed
     clearSkidMarks();
+    if ( typeof resetDualsenseState === 'function' ) resetDualsenseState();
     if ( typeof _broadcastLocalMeta === 'function' ) _broadcastLocalMeta();
 
 }
@@ -1057,6 +1058,38 @@ function _dsSetTrigger( side, mode, params ) {
 }
 
 function dsTriggerOff( side ) { _dsSetTrigger( side, 0x00, [ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ] ); }
+
+// Wipe all per-frame edge-detection state used by updateDualsense(). Called
+// from the R-reset / car-swap / map-swap paths so the teleport's chaotic
+// suspension/slip discontinuities don't synthesize false kerb/wheelspin/
+// shift-tick events on the spawn frame, and so the 80ms mode-hold from
+// a pre-reset cue doesn't suppress the next real event.
+function resetDualsenseState() {
+
+    ds.prevTcEngaged = false;
+    ds.prevAbsEngaged = false;
+    ds.prevOffTrack = false;
+    ds.prevShiftCd = 0;
+    ds.prevLatSlip = false;
+    ds.prevSusp[ 0 ] = 0;
+    ds.prevSusp[ 1 ] = 0;
+    ds.prevSusp[ 2 ] = 0;
+    ds.prevSusp[ 3 ] = 0;
+    ds.tcBumpUntil = 0;
+    ds.absPulseUntil = 0;
+    ds.revLimitUntil = 0;
+    ds.revLimitCooldownUntil = 0;
+    ds.shiftTickUntil = 0;
+    ds.kerbHitUntil = 0;
+    ds.latSlipUntil = 0;
+    ds.lastR2Mode = 0;
+    ds.lastL2Mode = 0;
+    ds.lastR2ModeAt = 0;
+    ds.lastL2ModeAt = 0;
+    dsTriggerOff( 'L2' );
+    dsTriggerOff( 'R2' );
+
+}
 
 // All adaptive-trigger parameters are 0..255 in the native protocol
 // (verified against github.com/daidr/dualsense-tester reference).
@@ -5546,6 +5579,7 @@ async function swapMap( id ) {
         chaseCam.initialized = false;
         resetTires();
         resetDrivetrain();
+        resetDualsenseState();
 
     }
 
@@ -7451,6 +7485,7 @@ function applyVehicleForces( speed, dt ) {
         resetDrivetrain();
         clearSkidMarks();
         lapTimerResetCurrent();
+        resetDualsenseState();
         return;
 
     }
