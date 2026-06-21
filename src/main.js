@@ -4403,18 +4403,25 @@ const steeringCfg = {
 // for the stats panel. Toggle with N (keyboard) / D-pad down (gamepad).
 const tcCfg = {
     enabled: true,
-    slipThreshold: 0.13,        // engages earlier (was 0.16) — peak Pacejka slip is ~0.14
-    cutGain: 6.0,               // harder cut per unit of slip overshoot (was 4.5)
-    minMult: 0.15,              // can cut to 15% throttle (was 18%)
+    // Defaults are deliberately lenient — a real production-car TC system
+    // never strangles below ~45% throttle, and players who turned TC ON for
+    // safety still want the car to *accelerate*. Aggressive per-car TC (with
+    // a tighter slipThreshold + lower minMult) is achievable by setting
+    // `tc: { ... }` on a car in CARS — that block merges over these defaults
+    // inside tractionCutFactor(). High-performance cars (F1, Supercar) get
+    // VERY lenient TC; economy cars use the defaults below.
+    slipThreshold: 0.16,        // lenient floor — real TC tolerates ~15–20% slip before cutting
+    cutGain: 4.0,               // gentle ramp — was 6.0 which slammed to minMult on tiny overshoot
+    minMult: 0.45,              // never cut below 45% — was 0.15, which was "limp mode" not TC
     // Low-speed exemption: below this speed TC is fully off. The slip-ratio
     // math is mathematically unstable here (divides by tiny speed) and we
     // don't want to choke launches from a standstill / uphill / sand.
     minActiveSpeed: 1.0,
     // Speed-based fade-in: between minActiveSpeed and fadeInSpeed the TC
     // cut amount scales from 0 → full so it doesn't snap from "no cut" to
-    // "−82%" the moment we cross 1.2 m/s. Without this the player gets
+    // big cut the moment we cross 1.2 m/s. Without this the player gets
     // stuck at ~4 km/h on any slope — throttle dies on hill starts.
-    fadeInSpeed: 4.5,           // full TC reached sooner (was 6.0)
+    fadeInSpeed: 4.5,
     // Per-car grip scaling: cars with higher wheelFrictionSlip get
     // proportionally more slip headroom before TC engages.
     gripScale: 0.10
@@ -4535,6 +4542,10 @@ const CARS = [
         engineInertia: 0.20, clutchStiffness: 340, lsdLocking: 0.55,
         Cd: 0.0235, Cl: 0.0000,
         driveType: 'RWD',
+        // Lenient TC — muscle cars want to break the tyres loose on exit;
+        // a strict TC would defeat the whole personality. Players who turn
+        // TC ON still want it to drive, not strangle.
+        tc: { slipThreshold: 0.20, minMult: 0.55, cutGain: 3.5 },
         // Burnout king: 5 Hz pushrod-V8 limiter thud (slowest in fleet),
         // ka-CLUNK shifts (deepest startPos, longest hold), wheelspin is the
         // signature cue (slipThreshold 0.26 + 7 Hz "burning rubber" rumble +
@@ -4571,6 +4582,10 @@ const CARS = [
         engineInertia: 0.07, clutchStiffness: 600, lsdLocking: 0.75,
         Cd: 0.0128, Cl: 0.0080,
         driveType: 'RWD',
+        // GT3-style PSM — wide slip headroom, soft cuts. Real 911 TC barely
+        // intervenes; the car is meant to be driven, the system catches the
+        // genuine "about to spin" moment, not every exit oversteer.
+        tc: { slipThreshold: 0.22, minMult: 0.60, cutGain: 3.0 },
         // The scalpel: 15 Hz electronic 9200 rpm scream (capped at protocol max),
         // crisp PDK paddle (startPos 150 — deepest, 55 ms hold — shortest),
         // 911 rear-rotation slide cue at low threshold (0.34) and fast 10 Hz
@@ -4607,6 +4622,10 @@ const CARS = [
         engineInertia: 0.12, clutchStiffness: 460, lsdLocking: 0.90,
         Cd: 0.0290, Cl: 0.0030,
         driveType: 'AWD',
+        // AWD launch needs throttle — all four wheels share the load and
+        // an aggressive TC would defeat the launch advantage. Wide threshold
+        // + high floor so the car puts power down hard out of corners.
+        tc: { slipThreshold: 0.24, minMult: 0.60, cutGain: 3.0 },
         // Gravel-spec all-rounder: AWD wheelspin is brief 11 Hz "all-four
         // clawing" texture starting at low startPos (felt across pull), slide
         // is the signature (early threshold 0.32 + long 280 ms hold for Scandi
@@ -4645,6 +4664,10 @@ const CARS = [
         engineInertia: 0.13, clutchStiffness: 620, lsdLocking: 0.80,
         Cd: 0.0182, Cl: 0.0140,
         driveType: 'RWD',
+        // Sophisticated TC, similar to 911. The car has the power to break
+        // tyres loose on demand but the system catches genuine spin events
+        // without choking the player on every throttle blip.
+        tc: { slipThreshold: 0.22, minMult: 0.60, cutGain: 3.0 },
         // Italian cathedral: V12 rev limiter is a deliberate 12 Hz "shoulder
         // tap" with long 300 ms hold (heavy crank inertia), dual-clutch shift
         // is sharp at deep startPos (145) with 55 ms snap, broad torque means
@@ -4687,6 +4710,10 @@ const CARS = [
         engineInertia: 0.07, clutchStiffness: 800, lsdLocking: 1.00,
         Cd: 0.0190, Cl: 0.0420,
         driveType: 'RWD',
+        // Real F1 TC (when it existed) was barely perceptible — the system
+        // managed wheelspin without the driver feeling it. Very wide slip
+        // headroom + high floor so the car launches like an F1 car should.
+        tc: { slipThreshold: 0.28, minMult: 0.75, cutGain: 2.5 },
         // Knife-edge: 15 Hz 17,500 rpm electronic scream (protocol-capped),
         // revLimit cooldown 220 ms tucks just under the 200 ms hold so a held
         // redline scream reads as continuous rather than 1.8 Hz on/off pattern.
@@ -4734,6 +4761,10 @@ const CARS = [
         engineInertia: 0.18, clutchStiffness: 900, lsdLocking: 0.90,
         Cd: 0.0165, Cl: 0.0850,
         driveType: 'AWD',
+        // Fantasy car — TC is "smart enough" to never actually limit you.
+        // High threshold + 80% floor means the only thing TC ever does is
+        // shave a sliver of torque off the genuinely catastrophic moments.
+        tc: { slipThreshold: 0.32, minMult: 0.80, cutGain: 2.0 },
         // Fantasy fastest-in-fleet: synthetic + surgical. 15 Hz screams at
         // the protocol ceiling (rev + ABS), 10-speed shifts are 30 ms micro-
         // blips at startPos 175, magic tyres mean wheelspin/slide thresholds
@@ -7343,11 +7374,19 @@ function tractionCutFactor( slipRatio, speed, car ) {
     if ( ! tcCfg.enabled ) return 1;
     const absSpeed = Math.abs( speed );
     if ( absSpeed < tcCfg.minActiveSpeed ) return 1;
+    // Per-car TC override (car.tc) is merged onto tcCfg defaults. Lets a
+    // high-perf car (F1, Supercar) have a wider slipThreshold + higher
+    // minMult so TC barely intervenes during a launch, while economy cars
+    // keep the conservative defaults.
+    const ov = car && car.tc ? car.tc : null;
+    const baseSlip = ov && ov.slipThreshold != null ? ov.slipThreshold : tcCfg.slipThreshold;
+    const cutGain  = ov && ov.cutGain       != null ? ov.cutGain       : tcCfg.cutGain;
+    const minMult  = ov && ov.minMult       != null ? ov.minMult       : tcCfg.minMult;
     const carGrip = car ? ( car.wheelFrictionSlip || 2.0 ) : 2.0;
-    const threshold = tcCfg.slipThreshold * ( 1 + ( carGrip - 2.0 ) * tcCfg.gripScale );
+    const threshold = baseSlip * ( 1 + ( carGrip - 2.0 ) * tcCfg.gripScale );
     const excess = Math.abs( slipRatio ) - threshold;
     if ( excess <= 0 ) return 1;
-    let cut = excess * tcCfg.cutGain;
+    let cut = excess * cutGain;
     // Smooth fade-in: TC strength scales from 0 (at minActiveSpeed) to 1
     // (at fadeInSpeed) so accelerating out of standstill / uphill / sand
     // doesn't snap into a hard torque cut the moment we leave the exemption.
@@ -7357,7 +7396,7 @@ function tractionCutFactor( slipRatio, speed, car ) {
         cut *= Math.max( 0, Math.min( 1, fade ) );
 
     }
-    return Math.max( tcCfg.minMult, 1 - cut );
+    return Math.max( minMult, 1 - cut );
 
 }
 
