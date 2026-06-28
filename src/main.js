@@ -8436,44 +8436,84 @@ function _addTaillight( parent, geom, mat, pos, isReverse ) {
 
 function _buildHatchback( parent ) {
 
-    // Clean simple hatchback — yellow body with a small black cabin band on top.
-    // Short bonnet, flat solid-yellow rear (no rear glass cutout). Minimal trim.
+    // Stylized hot-hatch — Golf MkII / EG6 / 205 GTI vibe.
+    // Layered body (lower tub + upper shoulder), sloped windshield + rear hatch glass,
+    // 2-piece tapered cabin, short bonnet, distinct bumpers and corner chamfers.
     const bodyMat = new THREE.MeshStandardMaterial( { color: 0xFFCB47, roughness: 0.55, metalness: 0.15 } );
     const cabinMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.2, metalness: 0.6 } );
     const trimMat = new THREE.MeshStandardMaterial( { color: 0x2A2A2A, roughness: 0.7, metalness: 0.1 } );
-    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFAA22, emissive: 0xFF9900, emissiveIntensity: 0.5 } );
+    const bumperMat = new THREE.MeshStandardMaterial( { color: 0x1E1E1E, roughness: 0.75, metalness: 0.1 } );
+    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEC0, emissive: 0xFFCC55, emissiveIntensity: 0.6 } );
     const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.7 } );
 
-    // Main body — single clean elongated yellow tub
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.7, 3.6 ), bodyMat, [ 0, - 0.05, 0 ] );
+    // ── Body layer 1: lower tub (wider, lower section — sills) ────────────
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.78, 0.34, 3.5 ), bodyMat, [ 0, - 0.18, 0 ] );
+    // Dark side-skirt strips (push out 5mm from tub side at x=±0.89)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.12, 2.6 ), trimMat, [ - 0.905, - 0.32, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.12, 2.6 ), trimMat, [ 0.905, - 0.32, 0 ] );
 
-    // Short bonnet bump at the front (lifted 3mm above body top to avoid z-fight)
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.08, 1.0 ), bodyMat, [ 0, 0.343, - 1.25 ] );
+    // ── Body layer 2: upper body / shoulder (narrower than tub) ───────────
+    // Top of tub at y=-0.01; sit upper body from y=0 → y=0.34 (height 0.34)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.34, 3.45 ), bodyMat, [ 0, 0.17, 0 ] );
+    // Belt-line trim — thin dark strip where upper meets lower (pushed out 5mm)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.025, 0.04, 3.3 ), trimMat, [ - 0.855, 0.005, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.025, 0.04, 3.3 ), trimMat, [ 0.855, 0.005, 0 ] );
 
-    // Black cabin band on top — extends from just behind the bonnet
-    // (z≈-0.625) all the way to just shy of the body rear face (z≈1.775),
-    // so the rear reads as a proper hatchback instead of a pickup bed.
-    // Depth 2.4, center z=0.575.
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.55, 0.32, 2.4 ), cabinMat, [ 0, 0.46, 0.575 ] );
-    // Thin yellow roof skin on top of cabin (lifted 3mm to avoid z-fight)
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.58, 0.05, 2.42 ), bodyMat, [ 0, 0.643, 0.575 ] );
+    // ── Bonnet — short, slight forward pitch (tilted nose-down ~5°) ───────
+    // Sits on top of upper body (y≈0.34), centred at z≈-1.25, length ~0.9
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.6, 0.06, 0.95 ), bodyMat, [ 0, 0.36, - 1.25 ], [ - 0.09, 0, 0 ] );
+    // Hood lip at the very front (small raised ridge above grille)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.55, 0.05, 0.06 ), bodyMat, [ 0, 0.345, - 1.72 ] );
 
-    // Front headlights — small amber pair (pushed out 5mm from body front face at -1.80)
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.32, 0.12, 0.06 ), headlightMat, [ - 0.6, 0.05, - 1.83 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.32, 0.12, 0.06 ), headlightMat, [ 0.6, 0.05, - 1.83 ] );
+    // ── Cabin — 2 piece tapered greenhouse ────────────────────────────────
+    // Front cabin (wider, slightly taller — A-pillar / windshield base zone)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.55, 0.36, 0.85 ), cabinMat, [ 0, 0.52, - 0.3 ] );
+    // Rear cabin (narrower, slightly lower — C-pillar / hatch zone)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.42, 0.32, 1.0 ), cabinMat, [ 0, 0.50, 0.7 ] );
+    // Yellow roof skin (narrower than shoulders, lifted 3mm above cabin)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.42, 0.05, 1.7 ), bodyMat, [ 0, 0.715, 0.18 ] );
 
-    // Rear taillights — small red pair (pushed out 5mm from body rear face at 1.80)
-    _addTaillight( parent, new THREE.BoxGeometry( 0.32, 0.12, 0.06 ), taillightMat, [ - 0.6, 0.05, 1.83 ], true );
-    _addTaillight( parent, new THREE.BoxGeometry( 0.32, 0.12, 0.06 ), taillightMat, [ 0.6, 0.05, 1.83 ], true );
+    // ── Windshield — sloped forward (~18° from vertical, leans back) ──────
+    // Positioned between bonnet rear and front cabin top
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.5, 0.04 ), cabinMat, [ 0, 0.5, - 0.76 ], [ - 0.32, 0, 0 ] );
 
-    // Side mirrors — stalk + housing each side
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.08 ), trimMat, [ - 0.86, 0.28, - 0.55 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.14, 0.1, 0.08 ), bodyMat, [ - 0.95, 0.3, - 0.55 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.08 ), trimMat, [ 0.86, 0.28, - 0.55 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.14, 0.1, 0.08 ), bodyMat, [ 0.95, 0.3, - 0.55 ] );
+    // ── Rear hatch glass — sloped backward (~22°, descending into trunk) ──
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.55, 0.04 ), cabinMat, [ 0, 0.43, 1.27 ], [ 0.38, 0, 0 ] );
+    // Rear trunk-lip spoiler (small ledge above tail)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.45, 0.04, 0.18 ), bodyMat, [ 0, 0.36, 1.55 ] );
 
-    // Thin roof antenna
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.03, 0.22, 0.03 ), trimMat, [ - 0.5, 0.78, 0.8 ] );
+    // ── Front bumper + grille recess ──────────────────────────────────────
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.78, 0.22, 0.14 ), bumperMat, [ 0, - 0.26, - 1.78 ] );
+    // Grille (thin dark recess between headlights, push out 5mm)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.9, 0.09, 0.04 ), trimMat, [ 0, - 0.06, - 1.755 ] );
+
+    // ── Rear bumper ───────────────────────────────────────────────────────
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.78, 0.22, 0.14 ), bumperMat, [ 0, - 0.26, 1.78 ] );
+
+    // ── Corner chamfers — small angled boxes to break 90° corners ─────────
+    // Front L/R (rotated ~25° around Y to fake a chamfer at the nose)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.32, 0.32 ), bodyMat, [ - 0.78, - 0.15, - 1.66 ], [ 0, - 0.45, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.32, 0.32 ), bodyMat, [ 0.78, - 0.15, - 1.66 ], [ 0, 0.45, 0 ] );
+    // Rear L/R
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.32, 0.32 ), bodyMat, [ - 0.78, - 0.15, 1.66 ], [ 0, 0.45, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.32, 0.32 ), bodyMat, [ 0.78, - 0.15, 1.66 ], [ 0, - 0.45, 0 ] );
+
+    // ── Headlights — small cluster pair on bumper top ─────────────────────
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.34, 0.1, 0.06 ), headlightMat, [ - 0.55, - 0.07, - 1.755 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.34, 0.1, 0.06 ), headlightMat, [ 0.55, - 0.07, - 1.755 ] );
+
+    // ── Taillights — small red pair (via _addTaillight) ───────────────────
+    _addTaillight( parent, new THREE.BoxGeometry( 0.32, 0.12, 0.06 ), taillightMat, [ - 0.6, - 0.05, 1.755 ], true );
+    _addTaillight( parent, new THREE.BoxGeometry( 0.32, 0.12, 0.06 ), taillightMat, [ 0.6, - 0.05, 1.755 ], true );
+
+    // ── Side mirrors — stalk + housing each side ──────────────────────────
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.08 ), trimMat, [ - 0.86, 0.36, - 0.62 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.14, 0.09, 0.08 ), bodyMat, [ - 0.95, 0.38, - 0.62 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.08 ), trimMat, [ 0.86, 0.36, - 0.62 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.14, 0.09, 0.08 ), bodyMat, [ 0.95, 0.38, - 0.62 ] );
+
+    // ── Thin roof antenna ─────────────────────────────────────────────────
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.03, 0.22, 0.03 ), trimMat, [ - 0.5, 0.85, 0.85 ] );
 
 }
 
