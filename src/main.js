@@ -78,8 +78,126 @@ const ai = {
     lineMesh: null,
     badgeEl: null,
     paintedMats: new Map(),
-    paintColor: 0x9933FF
+    paintColor: 0x9933FF,
+    // Stuck-recovery: if forward-velocity stays near zero while we're trying
+    // to drive, kick into a fixed-duration straight reverse to back off
+    // grass / wall, then let the per-frame direction picker reacquire the
+    // line in the correct heading. postRecoverUntil is a short grace window
+    // immediately after recovery during which we DON'T count stuck time, so
+    // the car has a moment to pick up forward speed before being judged
+    // wedged again.
+    stuckMs: 0,
+    recoverUntil: 0,
+    postRecoverUntil: 0
 };
+
+// ─── AI per-car / per-track tuning tables ────────────────────────────────
+// These multiply the offline-baked `wp.v` (m/s) and shape the AI controller's
+// brake-distance, trail-brake, and corner-exit decisions so each car drives
+// like its archetype on each circuit. Effective corner speed cap:
+//   v_cap = wp.v * car.gripMu * track.gripMu * track.aggression
+// (with a defensive 0.95 headroom enforced in the controller itself).
+//
+// IMPORTANT: `wp.v` is ALREADY grip-limited by the offline min-curvature
+// optimizer (v ≤ sqrt(μ·g/κ)), so multiplying by gripMu > 1 means "I trust my
+// tyres a hair more than the optimizer did" — keep it modest. `cornerEntryLift`
+// is similar: < 1.0 means "carry MORE speed into the corner than baked v",
+// which on grip-limited corners is the launch-off-track button. We CLAMP the
+// lift's effect downstream so vEff ≤ vCap × 1.04 max, but keeping these values
+// near 1.0 keeps the controller honest.
+//
+// Keys match CARS[*].name (lowercased / normalised) and MAPS object keys.
+const AI_CAR_PROFILES = {
+    // 1300 kg FWD hot-hatch baseline. Understeery, narrow tyres, modest brakes;
+    // no business trail-braking or pinning the throttle on exit.
+    hatchback: {
+        gripMu: 0.95, brakeBias: 0.95, throttleRamp: 0.55,
+        trailBrakeStrength: 0.05, apexSlipTarget: 0.06,
+        lookaheadGain: 0.95, cornerEntryLift: 1.00, slipLimit: 3.8
+    },
+    // 1700 kg RWD muscle. Heavy nose, fat torque, easy to swing the rear —
+    // gentler throttle ramp and a real slipLimit to keep the tail in check.
+    muscle: {
+        gripMu: 0.98, brakeBias: 1.00, throttleRamp: 0.50,
+        trailBrakeStrength: 0.08, apexSlipTarget: 0.09,
+        lookaheadGain: 1.00, cornerEntryLift: 1.00, slipLimit: 4.5
+    },
+    // 1430 kg RWD GT3-class. Sharp turn-in, high revs, real brakes; can carry
+    // serious speed mid-corner and trail-brake the front end.
+    sport: {
+        gripMu: 1.03, brakeBias: 1.15, throttleRamp: 0.80,
+        trailBrakeStrength: 0.14, apexSlipTarget: 0.10,
+        lookaheadGain: 1.10, cornerEntryLift: 0.99, slipLimit: 4.5
+    },
+    // AWD turbo rally. Stamp it on exit, late-brake into hairpins, big slip
+    // headroom (4WD pulls itself straight) and a higher trailBrake for rotation.
+    rally: {
+        gripMu: 1.05, brakeBias: 1.10, throttleRamp: 0.95,
+        trailBrakeStrength: 0.14, apexSlipTarget: 0.12,
+        lookaheadGain: 1.05, cornerEntryLift: 0.98, slipLimit: 5.5
+    },
+    // V12 RWD supercar. Massive top speed, big carbon brakes, but the rear
+    // bites if you ramp throttle too hard — slightly softer ramp than Sport.
+    supercar: {
+        gripMu: 1.05, brakeBias: 1.25, throttleRamp: 0.75,
+        trailBrakeStrength: 0.16, apexSlipTarget: 0.10,
+        lookaheadGain: 1.18, cornerEntryLift: 0.99, slipLimit: 4.8
+    },
+    // F1 — downforce + carbon-ceramic + slicks. Brake hard, attack apexes with
+    // moderate trail, full throttle on exit. Looks ~2 corners ahead. gripMu is
+    // intentionally modest above 1.0 because the baked v already saturates
+    // grip — the F1's advantage is the BRAKES and exit ramp, not corner cap.
+    f1: {
+        gripMu: 1.08, brakeBias: 1.45, throttleRamp: 1.00,
+        trailBrakeStrength: 0.22, apexSlipTarget: 0.11,
+        lookaheadGain: 1.35, cornerEntryLift: 0.99, slipLimit: 5.5
+    },
+    // God car — fantasy μ, fantasy brakes, fantasy aero. Planning ~3 corners
+    // ahead, late-braking to obscene degrees, hangs the rear on demand.
+    god: {
+        gripMu: 1.15, brakeBias: 1.55, throttleRamp: 1.00,
+        trailBrakeStrength: 0.22, apexSlipTarget: 0.14,
+        lookaheadGain: 1.55, cornerEntryLift: 0.98, slipLimit: 7.0
+    }
+};
+
+const AI_TRACK_PROFILES = {
+    // Nordschleife: bumpy, partly damp, long blind corners. Lower grip, look
+    // further ahead, run a hair under qualifying pace because we can't see
+    // over crests until late.
+    nurburgring:    { gripMu: 0.92, lookaheadBias: 1.20, aggression: 0.98 },
+    // GP layout: fresh, flat, modern asphalt. Stop-and-go style means we can
+    // afford to look slightly less far ahead and push grip closer to the limit.
+    nurburgring_gp: { gripMu: 1.02, lookaheadBias: 0.95, aggression: 1.02 },
+    // Suzuka: medium grip, flowy figure-8 with tight chicanes. Closer lookahead
+    // for the esses, neutral aggression.
+    suzuka:         { gripMu: 1.00, lookaheadBias: 0.90, aggression: 1.00 }
+};
+
+const AI_TRACK_DEFAULT = { gripMu: 1.00, lookaheadBias: 1.00, aggression: 1.00 };
+const AI_CAR_DEFAULT = {
+    gripMu: 1.00, brakeBias: 1.00, throttleRamp: 0.70,
+    trailBrakeStrength: 0.10, apexSlipTarget: 0.08,
+    lookaheadGain: 1.00, cornerEntryLift: 1.00, slipLimit: 4.5
+};
+
+function _aiCarProfile() {
+    // Normalise the CARS[*].name strings to the AI_CAR_PROFILES keys.
+    if ( ! currentCar ) return AI_CAR_DEFAULT;
+    const n = currentCar.name;
+    if ( n === 'Hatchback' )      return AI_CAR_PROFILES.hatchback;
+    if ( n === 'Muscle V8' )      return AI_CAR_PROFILES.muscle;
+    if ( n === 'Sport Flat-six' ) return AI_CAR_PROFILES.sport;
+    if ( n === 'Rally Turbo' )    return AI_CAR_PROFILES.rally;
+    if ( n === 'Supercar V12' )   return AI_CAR_PROFILES.supercar;
+    if ( n === 'F1' )             return AI_CAR_PROFILES.f1;
+    if ( n === 'God Car' )        return AI_CAR_PROFILES.god;
+    return AI_CAR_DEFAULT;
+}
+function _aiTrackProfile() {
+    return AI_TRACK_PROFILES[ currentMapId ] || AI_TRACK_DEFAULT;
+}
+
 let speedoEl, speedoNumEl, speedoGearEl, speedoRpmFillEl, speedoModeEl, speedoControllerEl;
 
 // Lucide SVG icons inlined so we don't pull in the whole lucide package.
@@ -8278,153 +8396,695 @@ function _addTaillight( parent, geom, mat, pos, isReverse ) {
 
 function _buildHatchback( parent ) {
 
+    // Boxy 3-door commuter — think MkII Golf / late-80s Civic.
+    // Upright cabin, short bonnet, vertical hatch, plastic black bumpers.
     const bodyMat = new THREE.MeshStandardMaterial( { color: 0xFFCB47, roughness: 0.55, metalness: 0.15 } );
-    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x202830, roughness: 0.3, metalness: 0.4 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.2, metalness: 0.6 } );
+    const roofMat = new THREE.MeshStandardMaterial( { color: 0xFFCB47, roughness: 0.55, metalness: 0.15 } );
+    const bumperMat = new THREE.MeshStandardMaterial( { color: 0x1A1A1A, roughness: 0.8, metalness: 0.05 } );
+    const trimMat = new THREE.MeshStandardMaterial( { color: 0x2A2A2A, roughness: 0.7, metalness: 0.1 } );
+    const grilleMat = new THREE.MeshStandardMaterial( { color: 0x111111, roughness: 0.6, metalness: 0.3 } );
+    const chromeMat = new THREE.MeshStandardMaterial( { color: 0xC8CCD0, roughness: 0.25, metalness: 0.9 } );
     const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.6 } );
     const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.7 } );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.7, 3.7 ), bodyMat, [ 0, - 0.15, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.55, 0.5, 1.9 ), cabinMat, [ 0, 0.45, 0.05 ] );
-    for ( const x of [ - 0.6, 0.6 ] ) {
+    const indicatorMat = new THREE.MeshStandardMaterial( { color: 0xFFAA22, emissive: 0xFF9900, emissiveIntensity: 0.4 } );
 
-        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, - 0.08, - 1.86 ] );
-        _addTaillight( parent, _visLightGeom, taillightMat, [ x, - 0.02, 1.86 ], true );
+    // Main body — lower body tub
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.55, 3.6 ), bodyMat, [ 0, - 0.2, 0 ] );
+    // Side skirts / sill trim
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.18, 3.5 ), trimMat, [ - 0.93, - 0.42, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.18, 3.5 ), trimMat, [ 0.93, - 0.42, 0 ] );
+    // Belt-line trim
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.87, 0.04, 3.55 ), trimMat, [ 0, 0.06, 0 ] );
+
+    // Cabin glass (greenhouse) — taller than typical, slightly forward of center
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.6, 0.5, 1.9 ), cabinMat, [ 0, 0.35, 0.1 ] );
+    // Steel roof on top of greenhouse (lifted 3mm to avoid z-fight with cabin top)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.62, 0.08, 1.95 ), roofMat, [ 0, 0.643, 0.1 ] );
+    // A-pillars (tilt forward slightly to suggest rake — using boxes only)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.1 ), roofMat, [ - 0.78, 0.35, - 0.78 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.1 ), roofMat, [ 0.78, 0.35, - 0.78 ] );
+    // B-pillars
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.12 ), roofMat, [ - 0.78, 0.35, 0.2 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.12 ), roofMat, [ 0.78, 0.35, 0.2 ] );
+    // C-pillars (vertical hatch look)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.1, 0.5, 0.14 ), roofMat, [ - 0.77, 0.35, 1.0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.1, 0.5, 0.14 ), roofMat, [ 0.77, 0.35, 1.0 ] );
+
+    // Bonnet (short)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.06, 1.0 ), bodyMat, [ 0, 0.16, - 1.25 ] );
+    // Rear hatch (vertical) — pushed 5 mm aft so its front face (1.78)
+    // doesn't graze the body's back face (1.80) and Z-fight the yellow.
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.55, 0.06 ), bodyMat, [ 0, 0.15, 1.835 ] );
+    // Rear hatch glass — pushed 5 mm aft to clear the body's back face.
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.42, 0.04 ), cabinMat, [ 0, 0.32, 1.845 ] );
+
+    // Front bumper (chunky plastic black)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.28, 0.22 ), bumperMat, [ 0, - 0.32, - 1.82 ] );
+    // Rear bumper
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.28, 0.22 ), bumperMat, [ 0, - 0.32, 1.82 ] );
+
+    // Grille
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.9, 0.14, 0.05 ), grilleMat, [ 0, - 0.05, - 1.83 ] );
+    // Chrome grille slats
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.85, 0.03, 0.06 ), chromeMat, [ 0, 0.0, - 1.84 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.85, 0.03, 0.06 ), chromeMat, [ 0, - 0.08, - 1.84 ] );
+
+    // Headlight clusters (rectangular pair each side: main + indicator)
+    for ( const x of [ - 0.66, 0.66 ] ) {
+
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.42, 0.18, 0.08 ), headlightMat, [ x, - 0.08, - 1.86 ] );
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.1, 0.08 ), indicatorMat, [ x + ( x > 0 ? 0.26 : - 0.26 ), - 0.08, - 1.86 ] );
+        // Tail cluster with red + amber indicator strip
+        _addTaillight( parent, new THREE.BoxGeometry( 0.42, 0.18, 0.08 ), taillightMat, [ x, - 0.05, 1.86 ], true );
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.1, 0.08 ), indicatorMat, [ x + ( x > 0 ? 0.26 : - 0.26 ), - 0.05, 1.86 ] );
 
     }
+
+    // Side mirrors on stalks
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.1 ), trimMat, [ - 0.86, 0.18, - 0.6 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.12, 0.08 ), bodyMat, [ - 0.96, 0.2, - 0.6 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.1 ), trimMat, [ 0.86, 0.18, - 0.6 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.12, 0.08 ), bodyMat, [ 0.96, 0.2, - 0.6 ] );
+
+    // Door handles (one each side)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.05, 0.18 ), chromeMat, [ - 0.94, 0.0, - 0.1 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.05, 0.18 ), chromeMat, [ 0.94, 0.0, - 0.1 ] );
+
+    // Roof antenna
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.28, 0.04 ), trimMat, [ - 0.55, 0.82, 0.9 ] );
+
+    // Small exhaust tip
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.16, 0.1, 0.1 ), chromeMat, [ 0.55, - 0.4, 1.92 ] );
+
+    // License plate panel
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.5, 0.14, 0.03 ), chromeMat, [ 0, - 0.25, 1.9 ] );
 
 }
 
 function _buildMuscleV8( parent ) {
 
+    // Late-60s American fastback — Charger / Mustang vibe.
+    // Long bonnet, fastback roofline, twin stripes, scoop, dual exhaust, wide haunches.
     const bodyMat = new THREE.MeshStandardMaterial( { color: 0xB42020, roughness: 0.45, metalness: 0.25 } );
-    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x101418, roughness: 0.3, metalness: 0.5 } );
-    const stripeMat = new THREE.MeshStandardMaterial( { color: 0x0A0A0A, roughness: 0.6, metalness: 0.2 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.2, metalness: 0.6 } );
+    const stripeMat = new THREE.MeshStandardMaterial( { color: 0x0A0A0A, roughness: 0.5, metalness: 0.3 } );
+    const bumperMat = new THREE.MeshStandardMaterial( { color: 0xB0B4B8, roughness: 0.3, metalness: 0.9 } );
+    const grilleMat = new THREE.MeshStandardMaterial( { color: 0x111111, roughness: 0.6, metalness: 0.4 } );
+    const exhaustMat = new THREE.MeshStandardMaterial( { color: 0x4A4A4A, roughness: 0.45, metalness: 0.85 } );
+    const chromeMat = new THREE.MeshStandardMaterial( { color: 0xCCD0D4, roughness: 0.2, metalness: 0.95 } );
     const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.7 } );
     const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.8 } );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.8, 3.7 ), bodyMat, [ 0, - 0.1, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.45, 1.4 ), cabinMat, [ 0, 0.5, 0.55 ], [ - 0.08, 0, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.25, 0.95, 3.72 ), stripeMat, [ - 0.35, 0.32, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.25, 0.95, 3.72 ), stripeMat, [ 0.35, 0.32, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.3, 0.12, 0.5 ), bodyMat, [ - 0.3, 0.36, - 0.9 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.3, 0.12, 0.5 ), bodyMat, [ 0.3, 0.36, - 0.9 ] );
-    for ( const x of [ - 0.65, 0.65 ] ) {
 
-        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, 0, - 1.86 ] );
-        _addTaillight( parent, _visLightGeom, taillightMat, [ x, 0.05, 1.86 ], true );
+    // Main lower body
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.55, 3.7 ), bodyMat, [ 0, - 0.15, 0 ] );
+    // Wide rear haunches (extend body sides at rear)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.45, 1.4 ), bodyMat, [ - 0.96, - 0.18, 0.9 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.45, 1.4 ), bodyMat, [ 0.96, - 0.18, 0.9 ] );
+    // Upper body / shoulder
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.25, 3.7 ), bodyMat, [ 0, 0.22, 0 ] );
+
+    // Long bonnet — extends forward
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.65, 0.1, 1.45 ), bodyMat, [ 0, 0.4, - 1.05 ] );
+    // Bonnet scoop (raised)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.55, 0.12, 0.6 ), bodyMat, [ 0, 0.5, - 1.0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.45, 0.04, 0.08 ), cabinMat, [ 0, 0.55, - 1.22 ] );
+
+    // Fastback roof — tilted sloping down to rear
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.4, 2.0 ), cabinMat, [ 0, 0.52, 0.4 ], [ - 0.14, 0, 0 ] );
+    // Steel roof skin
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.52, 0.08, 1.6 ), bodyMat, [ 0, 0.78, 0.0 ], [ - 0.14, 0, 0 ] );
+
+    // Twin lengthwise racing stripes on bonnet + roof + boot (lifted 3mm above bonnet top)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.22, 0.02, 3.7 ), stripeMat, [ - 0.3, 0.463, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.22, 0.02, 3.7 ), stripeMat, [ 0.3, 0.463, 0 ] );
+    // Stripes continuing on the angled roof
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.22, 0.02, 1.6 ), stripeMat, [ - 0.3, 0.82, 0.0 ], [ - 0.14, 0, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.22, 0.02, 1.6 ), stripeMat, [ 0.3, 0.82, 0.0 ], [ - 0.14, 0, 0 ] );
+
+    // Front chrome bumper
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.18, 0.2 ), bumperMat, [ 0, - 0.05, - 1.85 ] );
+    // Rear chrome bumper
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.18, 0.2 ), bumperMat, [ 0, - 0.05, 1.85 ] );
+
+    // Grille (wide, dark, recessed)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.22, 0.08 ), grilleMat, [ 0, 0.15, - 1.84 ] );
+    // Chrome grille slats
+    for ( const sy of [ 0.2, 0.13, 0.08 ] ) _addCarMesh( parent, new THREE.BoxGeometry( 1.35, 0.02, 0.09 ), chromeMat, [ 0, sy, - 1.85 ] );
+    // Center grille emblem (pushed out 5mm so its front face clears the slats / grille box)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.16, 0.16, 0.04 ), chromeMat, [ 0, 0.14, - 1.875 ] );
+
+    // Quad low-mounted headlights (2 per side)
+    for ( const x of [ - 0.7, - 0.45, 0.45, 0.7 ] ) {
+
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.22, 0.18, 0.08 ), headlightMat, [ x, - 0.05, - 1.86 ] );
 
     }
+
+    // Rear horizontal taillight bar with red segments
+    for ( const x of [ - 0.7, - 0.35, 0, 0.35, 0.7 ] ) {
+
+        _addTaillight( parent, new THREE.BoxGeometry( 0.28, 0.16, 0.08 ), taillightMat, [ x, 0.13, 1.86 ], true );
+
+    }
+
+    // Dual exhaust tips
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.2, 0.18, 0.18 ), exhaustMat, [ - 0.55, - 0.3, 1.94 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.2, 0.18, 0.18 ), exhaustMat, [ 0.55, - 0.3, 1.94 ] );
+
+    // Side mirrors on stalks (mirror housings nudged outboard 3mm to avoid coplanar face with stalk)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.1 ), stripeMat, [ - 0.88, 0.32, - 0.5 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.16, 0.1, 0.08 ), bodyMat, [ - 0.983, 0.34, - 0.5 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.1 ), stripeMat, [ 0.88, 0.32, - 0.5 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.16, 0.1, 0.08 ), bodyMat, [ 0.983, 0.34, - 0.5 ] );
+
+    // Door handles
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.2 ), chromeMat, [ - 0.94, 0.12, - 0.05 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.2 ), chromeMat, [ 0.94, 0.12, - 0.05 ] );
+
+    // Fuel cap badge on rear quarter
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.12, 0.12 ), chromeMat, [ - 0.97, 0.15, 1.4 ] );
 
 }
 
 function _buildSportFlatSix( parent ) {
 
+    // Rear-engined coupe — 911 silhouette.
+    // Short overhangs, low cabin, sloped fastback rear, ducktail spoiler, round-cluster headlight bumps, side intakes.
     const bodyMat = new THREE.MeshStandardMaterial( { color: 0xC8CDD2, roughness: 0.4, metalness: 0.55 } );
-    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x0A0C10, roughness: 0.2, metalness: 0.6 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.2, metalness: 0.6 } );
+    const trimMat = new THREE.MeshStandardMaterial( { color: 0x1A1A1A, roughness: 0.7, metalness: 0.2 } );
+    const chromeMat = new THREE.MeshStandardMaterial( { color: 0xC8CCD0, roughness: 0.25, metalness: 0.9 } );
     const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.7 } );
     const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.8 } );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.5, 3.7 ), bodyMat, [ 0, - 0.25, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.45, 1.5 ), cabinMat, [ 0, 0.25, - 0.1 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.9, 0.25, 0.8 ), bodyMat, [ 0, 0.15, 1.2 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.08, 0.15 ), bodyMat, [ 0, 0.4, 1.7 ] );
-    for ( const x of [ - 0.6, 0.6 ] ) {
+    const indicatorMat = new THREE.MeshStandardMaterial( { color: 0xFFAA22, emissive: 0xFF9900, emissiveIntensity: 0.5 } );
 
-        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, - 0.18, - 1.86 ] );
-        _addTaillight( parent, new THREE.BoxGeometry( 0.6, 0.1, 0.08 ), taillightMat, [ x, 0.05, 1.86 ], true );
+    // Lower body — low, slim
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.4, 3.6 ), bodyMat, [ 0, - 0.3, 0 ] );
+    // Belt line / shoulder
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.18, 3.5 ), bodyMat, [ 0, - 0.0, 0 ] );
+
+    // Front fender humps (round-headlight bumps signature)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.42, 0.32, 1.1 ), bodyMat, [ - 0.7, 0.08, - 1.1 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.42, 0.32, 1.1 ), bodyMat, [ 0.7, 0.08, - 1.1 ] );
+
+    // Front bonnet (lower than fenders, classic 911 dip) — lifted 3mm to clear belt-line top
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.0, 0.08, 1.1 ), bodyMat, [ 0, 0.133, - 1.1 ] );
+
+    // Cabin glass
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.4, 1.5 ), cabinMat, [ 0, 0.3, - 0.1 ] );
+    // Steel roof
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.45, 0.06, 1.3 ), bodyMat, [ 0, 0.52, - 0.15 ] );
+
+    // Sloped fastback rear glass / body — angled down
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.06, 1.4 ), bodyMat, [ 0, 0.35, 0.9 ], [ - 0.35, 0, 0 ] );
+    // Rear engine cover (slatted look) — lifted 3mm to clear belt-line top
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.08, 1.2 ), trimMat, [ 0, 0.133, 1.2 ] );
+    for ( const sx of [ - 0.4, - 0.2, 0, 0.2, 0.4 ] ) _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 1.1 ), chromeMat, [ sx, 0.18, 1.2 ] );
+
+    // Rear haunches (wide hips)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.15, 0.35, 1.3 ), bodyMat, [ - 0.96, - 0.05, 1.0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.15, 0.35, 1.3 ), bodyMat, [ 0.96, - 0.05, 1.0 ] );
+
+    // Ducktail spoiler (lip + small wing on edge)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.05, 0.3 ), bodyMat, [ 0, 0.22, 1.78 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.55, 0.04, 0.12 ), trimMat, [ 0, 0.26, 1.85 ] );
+
+    // Side air intakes ahead of rear wheels
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.16, 0.5 ), trimMat, [ - 0.96, - 0.05, 0.4 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.16, 0.5 ), trimMat, [ 0.96, - 0.05, 0.4 ] );
+
+    // Front bumper / chin spoiler
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.16, 0.18 ), trimMat, [ 0, - 0.42, - 1.82 ] );
+    // Front splitter lip
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.04, 0.3 ), trimMat, [ 0, - 0.5, - 1.78 ] );
+
+    // Headlights (rounded but boxed — two stacked boxes per side for the "bump" look)
+    // Inner lens pushed forward 3mm so its back face doesn't coplanar-share with outer lens front face
+    for ( const x of [ - 0.7, 0.7 ] ) {
+
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.32, 0.22, 0.1 ), headlightMat, [ x, 0.13, - 1.62 ] );
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.28, 0.18, 0.06 ), headlightMat, [ x, 0.13, - 1.703 ] );
+        // Front amber indicator
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.16, 0.08, 0.06 ), indicatorMat, [ x * 0.5, - 0.18, - 1.86 ] );
 
     }
+    // Full-width rear taillight strip (broken into segments tagged as taillights)
+    for ( const x of [ - 0.7, - 0.35, 0, 0.35, 0.7 ] ) {
+
+        _addTaillight( parent, new THREE.BoxGeometry( 0.3, 0.1, 0.08 ), taillightMat, [ x, 0.05, 1.86 ], true );
+
+    }
+
+    // Centre exhaust tip (twin pipes close together)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.14, 0.16 ), chromeMat, [ - 0.12, - 0.42, 1.92 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.14, 0.16 ), chromeMat, [ 0.12, - 0.42, 1.92 ] );
+
+    // Side mirrors
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.1 ), trimMat, [ - 0.86, 0.16, - 0.7 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.16, 0.1, 0.08 ), bodyMat, [ - 0.96, 0.18, - 0.7 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.1 ), trimMat, [ 0.86, 0.16, - 0.7 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.16, 0.1, 0.08 ), bodyMat, [ 0.96, 0.18, - 0.7 ] );
+
+    // Door handles
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.16 ), chromeMat, [ - 0.94, 0.0, - 0.2 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.16 ), chromeMat, [ 0.94, 0.0, - 0.2 ] );
 
 }
 
 function _buildRallyTurbo( parent ) {
 
+    // 90s WRC 4-door rally hatch — Subaru Impreza WRC.
+    // Blue body, gold accents, flared arches, big wing, 4 roof spotlights, bonnet vent, mud flaps, side livery.
     const bodyMat = new THREE.MeshStandardMaterial( { color: 0x1F4DFF, roughness: 0.5, metalness: 0.2 } );
-    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x202830, roughness: 0.3, metalness: 0.4 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.2, metalness: 0.6 } );
     const goldMat = new THREE.MeshStandardMaterial( { color: 0xD4A52A, roughness: 0.4, metalness: 0.7 } );
+    const liveryMat = new THREE.MeshStandardMaterial( { color: 0xF8F8F8, roughness: 0.6, metalness: 0.1 } );
+    const trimMat = new THREE.MeshStandardMaterial( { color: 0x101010, roughness: 0.7, metalness: 0.15 } );
+    const grilleMat = new THREE.MeshStandardMaterial( { color: 0x080808, roughness: 0.6, metalness: 0.3 } );
+    const chromeMat = new THREE.MeshStandardMaterial( { color: 0xC8CCD0, roughness: 0.3, metalness: 0.9 } );
     const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.7 } );
     const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.8 } );
     const roofLightMat = new THREE.MeshStandardMaterial( { color: 0xFFF4B0, emissive: 0xFFEE55, emissiveIntensity: 1.0 } );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.85, 3.7 ), bodyMat, [ 0, - 0.05, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.65, 0.6, 1.9 ), cabinMat, [ 0, 0.65, 0.05 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.5, 0.12, 0.45 ), bodyMat, [ 0, 1.0, 0.1 ] );
-    const roofLightGeom = new THREE.BoxGeometry( 0.22, 0.18, 0.18 );
-    for ( const x of [ - 0.6, - 0.2, 0.2, 0.6 ] ) _addCarMesh( parent, roofLightGeom, roofLightMat, [ x, 1.05, - 0.6 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.1, 0.35 ), goldMat, [ 0, 0.65, 1.75 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.25, 0.35 ), goldMat, [ - 0.55, 0.5, 1.75 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.25, 0.35 ), goldMat, [ 0.55, 0.5, 1.75 ] );
-    for ( const x of [ - 0.7, 0.7 ] ) {
 
-        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, 0.05, - 1.86 ] );
-        _addTaillight( parent, _visLightGeom, taillightMat, [ x, 0.1, 1.86 ], true );
+    // Main body
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.7, 3.6 ), bodyMat, [ 0, - 0.1, 0 ] );
+
+    // Flared arches (front and rear, each side)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.5, 0.95 ), bodyMat, [ - 0.96, - 0.18, - 1.05 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.5, 0.95 ), bodyMat, [ 0.96, - 0.18, - 1.05 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.5, 0.95 ), bodyMat, [ - 0.96, - 0.18, 1.05 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.5, 0.95 ), bodyMat, [ 0.96, - 0.18, 1.05 ] );
+
+    // Side livery bars (white + gold horizontal stripes along doors)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.08, 1.9 ), liveryMat, [ - 0.96, 0.1, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.08, 1.9 ), liveryMat, [ 0.96, 0.1, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 1.9 ), goldMat, [ - 0.96, 0.02, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 1.9 ), goldMat, [ 0.96, 0.02, 0 ] );
+
+    // Cabin (greenhouse) — taller, 4-door so wider B-pillar area (lifted 3mm above body top)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.6, 0.5, 1.95 ), cabinMat, [ 0, 0.503, 0.05 ] );
+    // Steel roof
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.62, 0.08, 2.0 ), bodyMat, [ 0, 0.78, 0.05 ] );
+    // A/B/C pillars (lifted 3mm above body top, matches cabin lift)
+    for ( const x of [ - 0.78, 0.78 ] ) {
+
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.1 ), bodyMat, [ x, 0.503, - 0.88 ] );
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.1 ), bodyMat, [ x, 0.503, 0.1 ] );
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.1 ), bodyMat, [ x, 0.503, 0.98 ] );
 
     }
+
+    // Bonnet (lifted 3mm above body top)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.06, 1.1 ), bodyMat, [ 0, 0.283, - 1.2 ] );
+    // Bonnet vent (raised scoop)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.6, 0.08, 0.4 ), bodyMat, [ 0, 0.34, - 1.05 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.5, 0.04, 0.12 ), trimMat, [ 0, 0.4, - 1.18 ] );
+
+    // Rear hatch (lifted 3mm above body top)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.06, 1.1 ), bodyMat, [ 0, 0.283, 1.2 ] );
+
+    // Big rear wing — wide blade on 2 vertical stanchions
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.3, 0.06 ), trimMat, [ - 0.55, 0.45, 1.78 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.3, 0.06 ), trimMat, [ 0.55, 0.45, 1.78 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.08, 0.4 ), bodyMat, [ 0, 0.62, 1.78 ] );
+    // Wing endplates
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.18, 0.45 ), trimMat, [ - 0.85, 0.62, 1.78 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.18, 0.45 ), trimMat, [ 0.85, 0.62, 1.78 ] );
+    // Wing gold accent stripe (lifted 3mm above main wing blade top)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.02, 0.08 ), goldMat, [ 0, 0.673, 1.6 ] );
+
+    // 4 roof-mounted spot light pod (mounting bar + 4 lights) — lifted 3mm above roof top
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.04, 0.08 ), trimMat, [ 0, 0.843, - 0.6 ] );
+    const roofLightGeom = new THREE.BoxGeometry( 0.24, 0.2, 0.2 );
+    for ( const x of [ - 0.6, - 0.2, 0.2, 0.6 ] ) _addCarMesh( parent, roofLightGeom, roofLightMat, [ x, 0.923, - 0.62 ] );
+    // Light pod chrome rims
+    for ( const x of [ - 0.6, - 0.2, 0.2, 0.6 ] ) _addCarMesh( parent, new THREE.BoxGeometry( 0.26, 0.22, 0.04 ), chromeMat, [ x, 0.92, - 0.72 ] );
+
+    // Mud flaps behind front + rear wheels
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.3, 0.18 ), trimMat, [ - 0.96, - 0.42, - 0.68 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.3, 0.18 ), trimMat, [ 0.96, - 0.42, - 0.68 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.3, 0.18 ), trimMat, [ - 0.96, - 0.42, 1.42 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.3, 0.18 ), trimMat, [ 0.96, - 0.42, 1.42 ] );
+
+    // Front bumper / splitter
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.22, 0.2 ), trimMat, [ 0, - 0.32, - 1.82 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.04, 0.35 ), trimMat, [ 0, - 0.42, - 1.75 ] );
+    // Grille
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.1, 0.18, 0.06 ), grilleMat, [ 0, - 0.1, - 1.84 ] );
+    // Centre rally number disc area (large white square on door)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.4, 0.5 ), liveryMat, [ - 0.97, 0.2, - 0.1 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.4, 0.5 ), liveryMat, [ 0.97, 0.2, - 0.1 ] );
+
+    // Headlights (rectangular pair each side)
+    for ( const x of [ - 0.7, 0.7 ] ) {
+
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.36, 0.2, 0.08 ), headlightMat, [ x, 0.05, - 1.86 ] );
+
+    }
+    // Taillight cluster across boot
+    for ( const x of [ - 0.7, - 0.35, 0.35, 0.7 ] ) {
+
+        _addTaillight( parent, new THREE.BoxGeometry( 0.3, 0.18, 0.08 ), taillightMat, [ x, 0.05, 1.86 ], true );
+
+    }
+
+    // Exhaust tip (single big rally cannon)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.22, 0.18, 0.2 ), chromeMat, [ 0.45, - 0.32, 1.94 ] );
+
+    // Side mirrors
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.1 ), trimMat, [ - 0.86, 0.32, - 0.65 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.12, 0.08 ), bodyMat, [ - 0.97, 0.34, - 0.65 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.1 ), trimMat, [ 0.86, 0.32, - 0.65 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.12, 0.08 ), bodyMat, [ 0.97, 0.34, - 0.65 ] );
+
+    // Door handles
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.16 ), chromeMat, [ - 0.99, 0.16, - 0.4 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.16 ), chromeMat, [ 0.99, 0.16, - 0.4 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.16 ), chromeMat, [ - 0.99, 0.16, 0.5 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.16 ), chromeMat, [ 0.99, 0.16, 0.5 ] );
+
+    // Roof antenna (rally radio)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.32, 0.04 ), trimMat, [ - 0.4, 0.98, 0.85 ] );
 
 }
 
 function _buildSupercarV12( parent ) {
 
-    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xFF6F1A, roughness: 0.55, metalness: 0.3 } );
-    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x0A0C10, roughness: 0.2, metalness: 0.6 } );
-    const darkMat = new THREE.MeshStandardMaterial( { color: 0x111111, roughness: 0.6, metalness: 0.3 } );
+    // Wedge-profile mid-engined supercar — Aventador / Diablo.
+    // Low, wide, sharp angles, scissor cut lines visible, side intakes, diffuser strakes, central exhaust, splitter.
+    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xFF6F1A, roughness: 0.4, metalness: 0.45 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.15, metalness: 0.7 } );
+    const darkMat = new THREE.MeshStandardMaterial( { color: 0x080808, roughness: 0.6, metalness: 0.3 } );
+    const carbonMat = new THREE.MeshStandardMaterial( { color: 0x141414, roughness: 0.55, metalness: 0.4 } );
+    const exhaustMat = new THREE.MeshStandardMaterial( { color: 0x4A4A4A, roughness: 0.4, metalness: 0.9 } );
+    const chromeMat = new THREE.MeshStandardMaterial( { color: 0xC8CCD0, roughness: 0.25, metalness: 0.95 } );
     const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.8 } );
+    const drlMat = new THREE.MeshStandardMaterial( { color: 0xC8E8FF, emissive: 0x66AAFF, emissiveIntensity: 0.8 } );
     const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.9 } );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.35, 3.7 ), bodyMat, [ 0, - 0.25, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.55, 0.5, 1.7 ), cabinMat, [ 0, 0.1, - 0.15 ], [ - 0.15, 0, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.8, 0.15, 0.7 ), bodyMat, [ 0, 0, 1.2 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.08, 0.3 ), darkMat, [ 0, - 0.5, - 1.75 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.6, 0.06, 0.2 ), darkMat, [ 0, 0.05, 1.85 ] );
-    for ( const x of [ - 0.55, 0.55 ] ) {
 
-        _addCarMesh( parent, new THREE.BoxGeometry( 0.4, 0.1, 0.08 ), headlightMat, [ x, - 0.18, - 1.86 ] );
-        _addTaillight( parent, new THREE.BoxGeometry( 0.45, 0.1, 0.08 ), taillightMat, [ x, 0, 1.86 ], true );
+    // Lower body — flat, low wedge
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.3, 3.7 ), bodyMat, [ 0, - 0.3, 0 ] );
+    // Front nose wedge (lower, sloped via thin slab)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.1, 0.9 ), bodyMat, [ 0, - 0.22, - 1.3 ] );
+    // Upper wedge slab lifted 3mm above lower-body top
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.6, 0.06, 0.6 ), bodyMat, [ 0, - 0.117, - 1.0 ] );
+
+    // Side haunches (wide rear hips)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.2, 0.4, 1.6 ), bodyMat, [ - 0.95, - 0.2, 0.8 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.2, 0.4, 1.6 ), bodyMat, [ 0.95, - 0.2, 0.8 ] );
+
+    // Cabin (very low, sloped forward like Aventador)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.45, 1.8 ), cabinMat, [ 0, 0.05, - 0.2 ], [ - 0.18, 0, 0 ] );
+    // Roof spine
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.5, 0.06, 1.6 ), bodyMat, [ 0, 0.32, - 0.3 ], [ - 0.18, 0, 0 ] );
+
+    // Scissor door cut lines (engraved into side as thin dark strips)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.4, 0.04 ), darkMat, [ - 0.92, - 0.1, - 0.5 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.4, 0.04 ), darkMat, [ 0.92, - 0.1, - 0.5 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 1.1 ), darkMat, [ - 0.92, - 0.1, 0.0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 1.1 ), darkMat, [ 0.92, - 0.1, 0.0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.4, 0.04 ), darkMat, [ - 0.92, - 0.1, 0.5 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.4, 0.04 ), darkMat, [ 0.92, - 0.1, 0.5 ] );
+
+    // Side intakes feeding rear engine — large slatted scoops
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.28, 0.8 ), darkMat, [ - 0.96, 0.05, 0.6 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.28, 0.8 ), darkMat, [ 0.96, 0.05, 0.6 ] );
+    for ( const sz of [ 0.4, 0.6, 0.8 ] ) {
+
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.05, 0.04, 0.05 ), chromeMat, [ - 0.97, 0.1, sz ] );
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.05, 0.04, 0.05 ), chromeMat, [ 0.97, 0.1, sz ] );
 
     }
+
+    // Rear engine deck (with glass louvres)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.08, 1.0 ), darkMat, [ 0, 0.05, 1.15 ] );
+    for ( const sx of [ - 0.5, - 0.25, 0, 0.25, 0.5 ] ) _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.06, 0.9 ), chromeMat, [ sx, 0.1, 1.15 ] );
+
+    // Rear deck spoiler lip (small active wing look) — blade lifted 3mm above strut tops
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.6, 0.06, 0.2 ), bodyMat, [ 0, 0.183, 1.7 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.18, 0.18 ), darkMat, [ - 0.55, 0.06, 1.7 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.18, 0.18 ), darkMat, [ 0.55, 0.06, 1.7 ] );
+
+    // Rear diffuser strakes (4 vertical fins under rear)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.1, 0.35 ), carbonMat, [ 0, - 0.48, 1.75 ] );
+    for ( const sx of [ - 0.6, - 0.2, 0.2, 0.6 ] ) _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.18, 0.35 ), carbonMat, [ sx, - 0.4, 1.78 ] );
+
+    // Front splitter — dropped 3mm so its top face clears the body underside
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.06, 0.4 ), carbonMat, [ 0, - 0.423, - 1.75 ] );
+    // Front canards (small wings on outer corners)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.22, 0.04, 0.16 ), carbonMat, [ - 0.84, - 0.32, - 1.75 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.22, 0.04, 0.16 ), carbonMat, [ 0.84, - 0.32, - 1.75 ] );
+
+    // Y-shape angular headlight + DRL signature (each side)
+    // DRL strips pushed forward 5mm so their front face no longer coplanar-fights with the main headlight front face
+    for ( const x of [ - 0.6, 0.6 ] ) {
+
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.4, 0.1, 0.08 ), headlightMat, [ x, - 0.05, - 1.86 ] );
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.04, 0.06 ), drlMat, [ x + ( x > 0 ? - 0.08 : 0.08 ), - 0.13, - 1.875 ] );
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.12, 0.06 ), drlMat, [ x + ( x > 0 ? - 0.15 : 0.15 ), - 0.0, - 1.875 ] );
+
+    }
+
+    // Rear taillight strip — Y-shaped, segmented
+    for ( const x of [ - 0.65, - 0.4, 0.4, 0.65 ] ) {
+
+        _addTaillight( parent, new THREE.BoxGeometry( 0.22, 0.1, 0.08 ), taillightMat, [ x, 0.0, 1.86 ], true );
+
+    }
+
+    // Large central exhaust tip (quad)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.6, 0.16, 0.16 ), exhaustMat, [ 0, - 0.22, 1.92 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.12, 0.04 ), darkMat, [ - 0.18, - 0.22, 1.96 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.12, 0.04 ), darkMat, [ 0.18, - 0.22, 1.96 ] );
+
+    // Side mirrors (small angular)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.08 ), darkMat, [ - 0.88, 0.12, - 0.7 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.16, 0.08, 0.08 ), bodyMat, [ - 0.97, 0.14, - 0.7 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.08 ), darkMat, [ 0.88, 0.12, - 0.7 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.16, 0.08, 0.08 ), bodyMat, [ 0.97, 0.14, - 0.7 ] );
 
 }
 
 function _buildF1( parent ) {
 
-    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xD11A1A, roughness: 0.45, metalness: 0.35 } );
-    const darkMat = new THREE.MeshStandardMaterial( { color: 0x0A0A0A, roughness: 0.5, metalness: 0.4 } );
-    const cockpitMat = new THREE.MeshStandardMaterial( { color: 0x050505, roughness: 0.7, metalness: 0.2 } );
+    // Modern F1 — cigar monocoque, sidepods, front wing assembly, rear wing, halo, airbox, barge boards, diffuser.
+    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xD11A1A, roughness: 0.4, metalness: 0.4 } );
+    const darkMat = new THREE.MeshStandardMaterial( { color: 0x080808, roughness: 0.5, metalness: 0.4 } );
+    const cockpitMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.6, metalness: 0.2 } );
+    const carbonMat = new THREE.MeshStandardMaterial( { color: 0x101010, roughness: 0.55, metalness: 0.5 } );
+    const accentMat = new THREE.MeshStandardMaterial( { color: 0xF8F8F8, roughness: 0.6, metalness: 0.1 } );
+    const exhaustMat = new THREE.MeshStandardMaterial( { color: 0x6A6A6A, roughness: 0.35, metalness: 0.95 } );
     const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 1.0 } );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.7, 0.25, 3.7 ), bodyMat, [ 0, - 0.2, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.35, 0.18, 1.0 ), bodyMat, [ 0, - 0.2, - 1.85 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.05, 0.35 ), bodyMat, [ 0, - 0.35, - 2.0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 2.0, 0.08, 0.45 ), bodyMat, [ 0, 0.45, 1.85 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.55, 0.4 ), bodyMat, [ - 0.55, 0.2, 1.85 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.55, 0.4 ), bodyMat, [ 0.55, 0.2, 1.85 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.5, 0.35, 0.5 ), cockpitMat, [ 0, 0, 0.3 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.7, 0.08, 0.6 ), darkMat, [ 0, 0.4, 0.3 ], [ 0.3, 0, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.6, 0.18, 0.6 ), bodyMat, [ 0, - 0.15, 1.0 ] );
-    _addTaillight( parent, new THREE.BoxGeometry( 0.18, 0.18, 0.08 ), taillightMat, [ 0, 0.1, 1.86 ], true );
+    const camMat = new THREE.MeshStandardMaterial( { color: 0x202020, roughness: 0.6, metalness: 0.3 } );
+
+    // Central monocoque tub (long cigar)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.55, 0.28, 2.4 ), bodyMat, [ 0, - 0.18, 0 ] );
+    // Nose cone — long thin pointed nose forward
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.32, 0.18, 1.1 ), bodyMat, [ 0, - 0.22, - 1.6 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.2, 0.12, 0.3 ), bodyMat, [ 0, - 0.22, - 2.1 ] );
+
+    // Front wing — main plane + flap on pylons (pylons lifted 3mm so their bottom face clears plane top)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.08, 0.3 ), carbonMat, [ - 0.1, - 0.337, - 2.15 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.08, 0.3 ), carbonMat, [ 0.1, - 0.337, - 2.15 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.04, 0.32 ), bodyMat, [ 0, - 0.4, - 2.05 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.03, 0.18 ), bodyMat, [ 0, - 0.36, - 1.92 ] );
+    // Front wing endplates (lifted 3mm so bottom face clears main-plane bottom)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.2, 0.45 ), carbonMat, [ - 0.97, - 0.317, - 2.0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.2, 0.45 ), carbonMat, [ 0.97, - 0.317, - 2.0 ] );
+    // Front wing accent stripe
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.02, 0.06 ), accentMat, [ 0, - 0.38, - 2.0 ] );
+
+    // Sidepods (left/right, around mid-rear of car)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.45, 0.32, 1.4 ), bodyMat, [ - 0.55, - 0.18, 0.4 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.45, 0.32, 1.4 ), bodyMat, [ 0.55, - 0.18, 0.4 ] );
+    // Sidepod intakes (dark mouth at front)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.32, 0.18, 0.12 ), darkMat, [ - 0.55, - 0.14, - 0.25 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.32, 0.18, 0.12 ), darkMat, [ 0.55, - 0.14, - 0.25 ] );
+
+    // Barge boards (vertical fins ahead of sidepods)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.22, 0.5 ), carbonMat, [ - 0.45, - 0.18, - 0.55 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.22, 0.5 ), carbonMat, [ 0.45, - 0.18, - 0.55 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.18, 0.3 ), carbonMat, [ - 0.6, - 0.2, - 0.4 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.18, 0.3 ), carbonMat, [ 0.6, - 0.2, - 0.4 ] );
+
+    // Floor / bargeboard floor extensions
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.03, 1.6 ), carbonMat, [ 0, - 0.36, 0.3 ] );
+
+    // Cockpit opening
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.5, 0.32, 0.5 ), cockpitMat, [ 0, - 0.04, - 0.05 ] );
+    // Driver helmet (small box poking up)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.3, 0.22, 0.3 ), darkMat, [ 0, 0.16, - 0.1 ] );
+    // Halo (front pillar + two side bows — simplified as 3 boxes forming a halo over cockpit)
+    // Rear hoop slightly shrunk in width + depth so its faces don't coplanar-share with the side bows
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.4, 0.06 ), carbonMat, [ 0, 0.18, - 0.4 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.06, 0.7 ), carbonMat, [ - 0.27, 0.32, - 0.05 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.06, 0.7 ), carbonMat, [ 0.27, 0.32, - 0.05 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.594, 0.06, 0.054 ), carbonMat, [ 0, 0.32, 0.273 ] );
+
+    // Airbox above driver feeding rear engine (pushed back 3mm so its front face clears cockpit back face)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.36, 0.32, 0.5 ), bodyMat, [ 0, 0.2, 0.453 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.28, 0.22, 0.08 ), darkMat, [ 0, 0.24, 0.22 ] );
+    // On-board camera pod (T-cam)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.08, 0.16 ), camMat, [ 0, 0.42, 0.45 ] );
+
+    // Engine cover / shark fin tapering to rear wing
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.36, 0.18, 1.0 ), bodyMat, [ 0, 0.08, 1.0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.32, 0.9 ), bodyMat, [ 0, 0.32, 1.0 ] );
+
+    // Rear wing — main plane + flap, on two side struts with endplates
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.45, 0.1 ), carbonMat, [ - 0.4, 0.3, 1.7 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.45, 0.1 ), carbonMat, [ 0.4, 0.3, 1.7 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.06, 0.35 ), bodyMat, [ 0, 0.52, 1.78 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.04, 0.18 ), bodyMat, [ 0, 0.6, 1.7 ] );
+    // Rear wing endplates
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.42, 0.45 ), carbonMat, [ - 0.97, 0.42, 1.75 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.42, 0.45 ), carbonMat, [ 0.97, 0.42, 1.75 ] );
+    // Rear wing accent
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.02, 0.05 ), accentMat, [ 0, 0.55, 1.62 ] );
+
+    // Rear crash structure / diffuser strakes
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.12, 0.4 ), carbonMat, [ 0, - 0.32, 1.75 ] );
+    for ( const sx of [ - 0.5, - 0.25, 0, 0.25, 0.5 ] ) _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.22, 0.35 ), carbonMat, [ sx, - 0.22, 1.78 ] );
+
+    // Single rear exhaust pipe poking out high above diffuser
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.14, 0.14, 0.2 ), exhaustMat, [ 0, 0.04, 1.74 ] );
+
+    // Rear rain light (FIA red — single tagged taillight)
+    _addTaillight( parent, new THREE.BoxGeometry( 0.18, 0.18, 0.08 ), taillightMat, [ 0, 0.18, 1.86 ], true );
+    // Endplate rear pos-lights (red flashing on each endplate)
+    _addTaillight( parent, new THREE.BoxGeometry( 0.06, 0.1, 0.04 ), taillightMat, [ - 0.97, 0.25, 1.95 ], true );
+    _addTaillight( parent, new THREE.BoxGeometry( 0.06, 0.1, 0.04 ), taillightMat, [ 0.97, 0.25, 1.95 ], true );
 
 }
 
 function _buildGodCar( parent ) {
 
-    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xF0F0F8, roughness: 0.15, metalness: 0.85 } );
-    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x0A0C10, roughness: 0.15, metalness: 0.7 } );
-    const darkMat = new THREE.MeshStandardMaterial( { color: 0x111111, roughness: 0.5, metalness: 0.4 } );
+    // Cyberpunk hypercar — very low, very wide, hard angles, neon underglow + seams, full LED strips, dorsal fin.
+    const bodyMat = new THREE.MeshStandardMaterial( { color: 0xF0F0F8, roughness: 0.12, metalness: 0.9 } );
+    const accentMat = new THREE.MeshStandardMaterial( { color: 0x222228, roughness: 0.2, metalness: 0.85 } );
+    const cabinMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.1, metalness: 0.7 } );
+    const darkMat = new THREE.MeshStandardMaterial( { color: 0x080808, roughness: 0.4, metalness: 0.5 } );
+    const carbonMat = new THREE.MeshStandardMaterial( { color: 0x101012, roughness: 0.45, metalness: 0.55 } );
     const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFFFFF, emissive: 0xFFFFFF, emissiveIntensity: 1.5 } );
-    const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 1.0 } );
+    const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 1.2 } );
     const roofLightMat = new THREE.MeshStandardMaterial( { color: 0xFFF4B0, emissive: 0xFFEE55, emissiveIntensity: 1.2 } );
-    const neonMat = new THREE.MeshStandardMaterial( { color: 0x00FFFF, emissive: 0x00FFFF, emissiveIntensity: 1.5 } );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.3, 3.7 ), bodyMat, [ 0, - 0.25, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.45, 1.7 ), cabinMat, [ 0, 0.15, - 0.1 ], [ - 0.15, 0, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.08, 0.3 ), darkMat, [ 0, - 0.5, - 1.75 ] );
-    const neon = new THREE.Mesh( new THREE.BoxGeometry( 1.7, 0.04, 3.4 ), neonMat );
-    neon.position.set( 0, - 0.46, 0 );
-    parent.add( neon );
-    _addCarMesh( parent, new THREE.BoxGeometry( 2.0, 0.08, 0.45 ), bodyMat, [ 0, 0.55, 1.8 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.4, 0.4 ), bodyMat, [ - 0.55, 0.35, 1.8 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.4, 0.4 ), bodyMat, [ 0.55, 0.35, 1.8 ] );
-    const roofLightGeom = new THREE.BoxGeometry( 0.2, 0.16, 0.16 );
-    for ( const x of [ - 0.5, - 0.17, 0.17, 0.5 ] ) _addCarMesh( parent, roofLightGeom, roofLightMat, [ x, 0.55, - 0.4 ] );
-    for ( const x of [ - 0.6, 0.6 ] ) {
+    const neonCyanMat = new THREE.MeshStandardMaterial( { color: 0x00FFFF, emissive: 0x00FFFF, emissiveIntensity: 2.0 } );
+    const neonMagentaMat = new THREE.MeshStandardMaterial( { color: 0xFF00FF, emissive: 0xFF00FF, emissiveIntensity: 1.8 } );
 
-        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, - 0.2, - 1.86 ] );
-        _addTaillight( parent, _visLightGeom, taillightMat, [ x, 0, 1.86 ], true );
+    // Main body — very flat, very wide
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.28, 3.6 ), bodyMat, [ 0, - 0.28, 0 ] );
+    // Front wedge nose
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.12, 1.0 ), bodyMat, [ 0, - 0.22, - 1.25 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.06, 0.5 ), bodyMat, [ 0, - 0.16, - 1.65 ] );
+
+    // Dark accent shoulder strip running length of car
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.95, 0.06, 3.4 ), accentMat, [ 0, - 0.1, 0 ] );
+
+    // Cabin (very low, sloped, dark glass)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.55, 0.4, 1.8 ), cabinMat, [ 0, 0.12, - 0.15 ], [ - 0.16, 0, 0 ] );
+    // Roof spine / dorsal fin
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.4, 0.08, 1.8 ), bodyMat, [ 0, 0.35, - 0.2 ], [ - 0.16, 0, 0 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.25, 1.2 ), accentMat, [ 0, 0.4, 0.6 ] );
+
+    // Wide rear haunches
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.4, 1.6 ), bodyMat, [ - 0.99, - 0.2, 0.9 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.4, 1.6 ), bodyMat, [ 0.99, - 0.2, 0.9 ] );
+
+    // Rear deck with glowing engine block visible (cyan core lifted 3mm above deck top)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.4, 0.06, 1.0 ), accentMat, [ 0, 0.08, 1.2 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.8, 0.04, 0.6 ), neonCyanMat, [ 0, 0.143, 1.2 ] );
+
+    // Rear active wing
+    _addCarMesh( parent, new THREE.BoxGeometry( 2.0, 0.06, 0.4 ), bodyMat, [ 0, 0.5, 1.78 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.32, 0.4 ), accentMat, [ - 0.55, 0.32, 1.78 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.32, 0.4 ), accentMat, [ 0.55, 0.32, 1.78 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.4, 0.45 ), accentMat, [ - 0.99, 0.36, 1.78 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.4, 0.45 ), accentMat, [ 0.99, 0.36, 1.78 ] );
+
+    // Front splitter + canards (splitter shrunk 8mm in width so its X side faces don't share plane with body sides)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.942, 0.06, 0.4 ), carbonMat, [ 0, - 0.38, - 1.75 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.24, 0.04, 0.18 ), carbonMat, [ - 0.86, - 0.28, - 1.75 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.24, 0.04, 0.18 ), carbonMat, [ 0.86, - 0.28, - 1.75 ] );
+
+    // Rear diffuser strakes (diffuser pan dropped 3mm so its top face clears body underside; shrunk 8mm width so side faces don't share plane with body)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.942, 0.08, 0.35 ), carbonMat, [ 0, - 0.463, 1.75 ] );
+    for ( const sx of [ - 0.7, - 0.35, 0, 0.35, 0.7 ] ) _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.18, 0.35 ), carbonMat, [ sx, - 0.38, 1.78 ] );
+
+    // ── NEON UNDERGLOW PAD (full chassis cyan glow) ─────────────────────────
+    // raw THREE.Mesh (no shadow tagging) so it reads as light, not a panel
+    const underglow = new THREE.Mesh( new THREE.BoxGeometry( 1.7, 0.04, 3.4 ), neonCyanMat );
+    underglow.position.set( 0, - 0.46, 0 );
+    parent.add( underglow );
+    // Side underglow strips (a bit lower so they bleed out the sides)
+    // Lifted 3mm so their bottom face clears the underglow pad top
+    const ugL = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.04, 3.2 ), neonCyanMat );
+    ugL.position.set( - 0.98, - 0.417, 0 );
+    parent.add( ugL );
+    const ugR = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.04, 3.2 ), neonCyanMat );
+    ugR.position.set( 0.98, - 0.417, 0 );
+    parent.add( ugR );
+
+    // Glowing wheel arch trims (cyan inside arch rim) — front L/R, rear L/R
+    for ( const [ x, z ] of [ [ - 0.95, - 1.05 ], [ 0.95, - 1.05 ], [ - 0.99, 1.05 ], [ 0.99, 1.05 ] ] ) {
+
+        const arch = new THREE.Mesh( new THREE.BoxGeometry( 0.06, 0.06, 0.95 ), neonCyanMat );
+        arch.position.set( x, - 0.05, z );
+        parent.add( arch );
 
     }
+
+    // Glowing body seams (magenta accent stripes along the doors)
+    const seamL = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.03, 1.8 ), neonMagentaMat );
+    seamL.position.set( - 0.96, 0.05, 0 );
+    parent.add( seamL );
+    const seamR = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.03, 1.8 ), neonMagentaMat );
+    seamR.position.set( 0.96, 0.05, 0 );
+    parent.add( seamR );
+
+    // Full-width front LED light bar (white)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.04, 0.06 ), headlightMat, [ 0, - 0.08, - 1.88 ] );
+    // Vertical LED slits (Tron-style headlights)
+    for ( const x of [ - 0.75, - 0.5, 0.5, 0.75 ] ) {
+
+        _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.16, 0.06 ), headlightMat, [ x, - 0.16, - 1.88 ] );
+
+    }
+    // Pair of higher main beams
+    for ( const x of [ - 0.62, 0.62 ] ) {
+
+        _addCarMesh( parent, _visLightGeom, headlightMat, [ x, - 0.04, - 1.86 ] );
+
+    }
+
+    // Full-width rear LED strip + segmented taillights
+    for ( const x of [ - 0.7, - 0.35, 0, 0.35, 0.7 ] ) {
+
+        _addTaillight( parent, new THREE.BoxGeometry( 0.3, 0.08, 0.06 ), taillightMat, [ x, 0.05, 1.86 ], true );
+
+    }
+    // Lower rear glow bar
+    _addTaillight( parent, new THREE.BoxGeometry( 1.7, 0.04, 0.06 ), taillightMat, [ 0, - 0.18, 1.88 ], true );
+
+    // Roof beacon array (kept from previous design — futuristic spotlight strip)
+    const roofLightGeom = new THREE.BoxGeometry( 0.18, 0.14, 0.14 );
+    for ( const x of [ - 0.5, - 0.17, 0.17, 0.5 ] ) _addCarMesh( parent, roofLightGeom, roofLightMat, [ x, 0.46, - 0.55 ] );
+
+    // Side air intakes (glowing inside)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.18, 0.7 ), darkMat, [ - 1.0, 0.05, 0.5 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.18, 0.7 ), darkMat, [ 1.0, 0.05, 0.5 ] );
+    const intakeL = new THREE.Mesh( new THREE.BoxGeometry( 0.03, 0.06, 0.6 ), neonCyanMat );
+    intakeL.position.set( - 1.01, 0.05, 0.5 );
+    parent.add( intakeL );
+    const intakeR = new THREE.Mesh( new THREE.BoxGeometry( 0.03, 0.06, 0.6 ), neonCyanMat );
+    intakeR.position.set( 1.01, 0.05, 0.5 );
+    parent.add( intakeR );
+
+    // Side mirrors (small angular cameras) — mirror housing nudged outboard 3mm to avoid coplanar face with stalk
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.08 ), darkMat, [ - 0.88, 0.18, - 0.65 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.14, 0.08, 0.08 ), accentMat, [ - 0.973, 0.2, - 0.65 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.08 ), darkMat, [ 0.88, 0.18, - 0.65 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.14, 0.08, 0.08 ), accentMat, [ 0.973, 0.2, - 0.65 ] );
 
 }
 
@@ -8478,22 +9138,98 @@ function addWheel( index, pos, carMesh ) {
     vehicleController.setWheelFrictionSlip( index, currentCar.wheelFrictionSlip );
     vehicleController.setWheelSteering( index, pos.z < 0 );
 
-    const geometry = new THREE.CylinderGeometry( WHEEL_RADIUS, WHEEL_RADIUS, wheelWidth, 16 );
-    geometry.rotateZ( Math.PI * 0.5 );
-    const material = new THREE.MeshStandardMaterial( { color: 0x000000 } );
-    const wheel = new THREE.Mesh( geometry, material );
-
-    wheel.castShadow = true;
+    // Wheel = Group containing a black tyre + a silver rim with 5 spokes +
+    // a hub cap on each visible face. The whole Group inherits the per-wheel
+    // spin/steer quaternion from updateWheels(), so the spokes visibly
+    // rotate when the car moves and sit still when stopped — load-bearing
+    // for "you can tell the car is rolling vs sliding" feedback.
+    const wheel = new THREE.Group();
     wheel.position.copy( pos );
+
+    // Tyre — pure 0x000000 so paintCarPurple() skips it (tyres stay black
+    // even in AI mode); see the hex-exception check in paintCarPurple.
+    const tyreGeom = new THREE.CylinderGeometry( WHEEL_RADIUS, WHEEL_RADIUS, wheelWidth, 20 );
+    tyreGeom.rotateZ( Math.PI * 0.5 );
+    const tyreMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.9, metalness: 0.0 } );
+    const tyre = new THREE.Mesh( tyreGeom, tyreMat );
+    tyre.castShadow = true;
+    wheel.add( tyre );
+
+    // Rim assembly mirrored on both faces of the tyre — at spawn we don't
+    // know whether this is a +X or -X wheel relative to the chassis, and
+    // the spokes need to be visible from the outboard face either way.
+    // Silver for the rim ring + 5 spokes. Black for the hub. Tyre also black
+    // (already set above). Net look: black wheel with a thin silver outline
+    // and 5 silver spokes radiating from a black centre.
+    const silverMat = new THREE.MeshStandardMaterial( { color: 0xC8CDD2, roughness: 0.3, metalness: 0.85 } );
+    const blackHubMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.6, metalness: 0.2 } );
+    const spokeLen = WHEEL_RADIUS * 0.70;
+    const spokeGeom = new THREE.BoxGeometry( 0.03, spokeLen, 0.05 );
+    spokeGeom.translate( 0, spokeLen * 0.5, 0 );  // base at y=0, tip at y=spokeLen
+    const hubGeom = new THREE.BoxGeometry( 0.05, 0.09, 0.09 );
+    // Thin silver outer ring — Torus so it's a real circle outline, not a
+    // disc. Default torus lies in XY plane; rotate around Y by π/2 so it
+    // sits in the YZ plane (perpendicular to the wheel's X spin axis).
+    // Sized smaller than the tyre (0.75× WHEEL_RADIUS) so it clearly reads
+    // as a rim INSIDE the tyre — like a real wheel.
+    const ringGeom = new THREE.TorusGeometry( WHEEL_RADIUS * 0.75, 0.015, 6, 28 );
+    ringGeom.rotateY( Math.PI * 0.5 );
+    for ( const side of [ - 1, 1 ] ) {
+
+        const sideX = side * ( wheelWidth * 0.5 + 0.008 );
+
+        // Thin silver outer ring.
+        const ring = new THREE.Mesh( ringGeom, silverMat );
+        ring.position.x = sideX;
+        ring.castShadow = true;
+        wheel.add( ring );
+
+        // Black hub cap at the wheel centre.
+        const hub = new THREE.Mesh( hubGeom, blackHubMat );
+        hub.position.x = sideX + side * 0.025;
+        hub.castShadow = true;
+        wheel.add( hub );
+
+        // Five silver spokes radiating from the hub to the ring.
+        for ( let s = 0; s < 5; s ++ ) {
+
+            const ang = ( s / 5 ) * Math.PI * 2;
+            const spoke = new THREE.Mesh( spokeGeom, silverMat );
+            spoke.position.x = sideX;
+            spoke.rotation.x = ang;
+            spoke.castShadow = true;
+            wheel.add( spoke );
+
+        }
+
+    }
 
     wheels.push( wheel );
     carMesh.add( wheel );
 
 }
 
-function updateWheels() {
+let _visualWheelSpin = 0;
+const _wheelFwdTmp = new THREE.Vector3();
+const _wheelQTmp = new THREE.Quaternion();
+function updateWheels( dt ) {
 
     if ( vehicleController === undefined ) return;
+
+    // Velocity-driven wheel spin: derive angular velocity from the chassis
+    // forward velocity (signed) divided by wheel radius. Always matches
+    // ground speed visually — no wheelspin on burnouts, no lockup under
+    // brakes, no per-axle independent slip. Just clean rolling.
+    if ( chassis ) {
+
+        const lv = chassis.linvel();
+        const r = chassis.rotation();
+        _wheelQTmp.set( r.x, r.y, r.z, r.w );
+        _wheelFwdTmp.set( 0, 0, - 1 ).applyQuaternion( _wheelQTmp );
+        const vFwd = lv.x * _wheelFwdTmp.x + lv.z * _wheelFwdTmp.z;
+        _visualWheelSpin += ( vFwd / WHEEL_RADIUS ) * ( dt || ( 1 / 60 ) );
+
+    }
 
     const wheelSteeringQuat = new THREE.Quaternion();
     const wheelRotationQuat = new THREE.Quaternion();
@@ -8515,7 +9251,7 @@ function updateWheels() {
         const connection = vehicleController.wheelChassisConnectionPointCs( index ).y || 0;
         const suspension = vehicleController.wheelSuspensionLength( index ) || 0;
         const steering = vehicleController.wheelSteering( index ) || 0;
-        const rotationRad = vehicleController.wheelRotation( index ) || 0;
+        const rotationRad = _visualWheelSpin;
 
         wheel.position.y = ( connection - suspension ) / carScaleY + wheelLift;
 
@@ -9309,7 +10045,7 @@ function animate( time ) {
         updateSuspensionGeometry();
         updateTires( delta );
 
-        updateWheels();
+        updateWheels( delta );
         updateSpeedometer( speed );
         updateBrakeLights();
         updateRumble( speed );
@@ -9483,6 +10219,10 @@ function toggleAiMode() {
 
         ai.enabled = false;
         ai._loggedEngage = false;
+        ai.stuckMs = 0;
+        ai.recoverUntil = 0;
+        ai.postRecoverUntil = 0;
+        input.reverseEngaged = false;
         paintCarPurple( false );
         disposeAiLineMesh();
         _showAiBadge( false );
@@ -9520,6 +10260,12 @@ function toggleAiMode() {
     }
 
     ai.enabled = true;
+    ai.stuckMs = 0;
+    ai.recoverUntil = 0;
+    // 3 s engage grace: the hatchback can take ~2 s to accelerate to 1 m/s
+    // from a dead standstill, and stuck-detection would otherwise fire at
+    // 1.5 s of "throttle on, vFwd < 1" and reverse the car right at spawn.
+    ai.postRecoverUntil = performance.now() + 3000;
     paintCarPurple( true );
     buildAiLineMesh();
     _showAiBadge( true );
@@ -9555,6 +10301,41 @@ function aiUpdate( dt ) {
     // Bail out on any deliberate human input — driver wants control back.
     if ( _aiPickedHumanInput() ) { toggleAiMode(); return; }
 
+    const now = performance.now();
+
+    // ─── stuck recovery (active) ───────────────────────────────────
+    // While the recovery timer is live, hold straight reverse. The auto
+    // transmission shifts to gear -1 because input.reverseEngaged is set,
+    // and input.brake doubles as reverse throttle in that mode (see
+    // applyVehicleForces around the reverseEngaged check).
+    if ( now < ai.recoverUntil ) {
+
+        input.steerRaw = 0;
+        input.steer = 0;
+        input.throttle = 0;
+        input.brake = 0.55;
+        input.handbrake = 0;
+        input.handbrakeAfterReset = false;
+        input.reverseEngaged = true;
+        return;
+
+    }
+    if ( ai.recoverUntil !== 0 ) {
+
+        // Recovery just expired this frame: clear reverseEngaged so the
+        // engine shifts back to forward on the first throttle application,
+        // and arm a generous post-recovery grace window. The car may have
+        // built up ~8 m/s of backward momentum during the 1.5 s reverse —
+        // it takes ~1 s of forward braking to bleed that off, another
+        // 1–2 s to actually start moving forward at >1 m/s. The grace
+        // window must outlast that whole sequence or stuck-detection
+        // re-fires and we loop reverse-and-stuck forever.
+        ai.recoverUntil = 0;
+        input.reverseEngaged = false;
+        ai.postRecoverUntil = now + 4000;
+
+    }
+
     const t = chassis.translation();
     const v = chassis.linvel();
     const speed = Math.hypot( v.x, v.z );
@@ -9568,20 +10349,55 @@ function aiUpdate( dt ) {
     _aiFwd.set( 0, 0, - 1 ).applyQuaternion( _aiTmpQ );
     _aiRight.set( 1, 0, 0 ).applyQuaternion( _aiTmpQ );
 
-    // Lookahead distance: faster → look further, so steering anticipates the
-    // line instead of chasing tail.
-    const lookAhead = THREE.MathUtils.clamp( 5 + speed * 0.45, 6, 28 );
+    // Per-car / per-track AI tuning — see AI_CAR_PROFILES / AI_TRACK_PROFILES
+    // near the top of this file. These shape every downstream decision
+    // (lookahead distance, corner-speed cap, brake strength, trail-brake,
+    // throttle ramp, slip threshold) so each car drives like its archetype on
+    // each circuit instead of a one-size-fits-all pure-pursuit drone.
+    const carP = _aiCarProfile();
+    const trackP = _aiTrackProfile();
+    const speedScale = carP.gripMu * trackP.gripMu * trackP.aggression;
+
+    // Lookahead distance: faster cars and longer-sight tracks look further;
+    // tight chicane tracks pull it in. Per-car lookaheadGain × per-track
+    // lookaheadBias scales the speed-adaptive base.
+    const laGain = carP.lookaheadGain * trackP.lookaheadBias;
+    const lookAhead = THREE.MathUtils.clamp(
+        ( 5 + speed * 0.55 ) * laGain,
+        6, 48
+    );
 
     // Pick lookahead target by scanning the WHOLE racing line and picking
     // the waypoint that is (a) in front of the car (lz > 0.5) and (b)
-    // closest to the desired lookahead distance. This sidesteps the
-    // racing-line's Hierholzer back-and-forth entirely — we don't need
-    // a loop-order direction, we just need the best ahead-waypoint.
-    // O(n) per frame (~8 k * cheap math = <0.2 ms at 60 fps).
+    // closest to the desired lookahead distance. This per-frame direction
+    // picker is load-bearing: the racing-line JSONs contain Hierholzer Euler
+    // back-and-forth so any single-step closestIdx+dir walk gets fooled.
+    //
+    // We also collect a *sequence* of forward waypoints (sorted by forward
+    // distance) so the controller below can scan their curvature for early
+    // brake demand and target the corner-entry, not just the steering point.
+    // O(n) per frame, identical asymptotics to the old direction-only scan.
     const fwdX = _aiFwd.x, fwdZ = _aiFwd.z;
-    const MAX_R = 120; // m — skip waypoints further than this
+    const MAX_R = 320; // m — must outrange the brake-distance scan window
+    // Brake-scan window: just enough to cover the physical braking distance
+    // from current speed to a near-stop, plus a margin. At 80 m/s with
+    // a≈10 m/s² we need ~320 m to stop; we cap at 260 m so the scan never
+    // grabs corners we'll see in plenty of time on the NEXT pass.
+    const scanRange = Math.min( 260, Math.max( 70, 50 + speed * 2.6 ) );
     let bestIdx = - 1, bestErr = Infinity;
     let closestForwardD = Infinity, closestForwardIdx = - 1;
+    // Forward-sector waypoints, captured for the curvature scan further down.
+    // Reused per-frame typed arrays would be marginally faster but the JSONs
+    // are ~8 k waypoints and only a fraction fall in the forward sector, so
+    // this stays well under the existing AI cost budget.
+    const fwdIdx = [];
+    const fwdDist = [];
+    // Also capture each waypoint's neighbor-median v so the curvature scan
+    // can detect-and-ignore Hierholzer U-turn artifacts (waypoints whose
+    // baked v is anomalously low because the extractor doubled back on itself
+    // at a junction). Without this guard, a 4 m/s artifact 80 m ahead on what
+    // looks like a straight section will pin brakeDemand=1 forever and the
+    // car just brakes-and-stops on every straight. See the scan loop below.
     for ( let i = 0; i < n; i ++ ) {
 
         const p = racingLine[ i ];
@@ -9592,8 +10408,12 @@ function aiUpdate( dt ) {
         if ( lzI < 0.5 ) continue;
         const d = Math.sqrt( d2 );
         const err = Math.abs( d - lookAhead );
-        if ( err < bestErr ) { bestErr = err; bestIdx = i; }
+        // Lookahead target: closest waypoint to the desired lookahead distance,
+        // with a 4 m floor so we never lock onto a waypoint right next to the
+        // car (which produces enormous alpha and a single-frame steer spike).
+        if ( d > 4 && err < bestErr ) { bestErr = err; bestIdx = i; }
         if ( d < closestForwardD ) { closestForwardD = d; closestForwardIdx = i; }
+        if ( d < scanRange ) { fwdIdx.push( i ); fwdDist.push( d ); }
 
     }
     // If nothing's in front at lookAhead range, fall back to the closest
@@ -9617,17 +10437,122 @@ function aiUpdate( dt ) {
 
         const tdx = target.x - t.x, tdz = target.z - t.z;
         const tlz = tdx * fwdX + tdz * fwdZ;
-        console.log( `[ai] engage: bestIdx=${ idx }  target=(${ target.x.toFixed( 1 ) }, ${ target.z.toFixed( 1 ) })  lz=${ tlz.toFixed( 1 ) }  d=${ Math.hypot( tdx, tdz ).toFixed( 1 ) }  speed=${ speed.toFixed( 1 ) }` );
+        console.log( `[ai] engage: bestIdx=${ idx }  target=(${ target.x.toFixed( 1 ) }, ${ target.z.toFixed( 1 ) })  lz=${ tlz.toFixed( 1 ) }  d=${ Math.hypot( tdx, tdz ).toFixed( 1 ) }  speed=${ speed.toFixed( 1 ) }  carMu=${ carP.gripMu }  trackMu=${ trackP.gripMu }` );
         ai._loggedEngage = true;
 
     }
+
+    // ─── Forward curvature + brake-distance scan ─────────────────────
+    // Walk forward waypoints (sorted by forward distance), compute the
+    // required deceleration to reach each waypoint's v cap:
+    //   a_req = (v² - v_t²) / (2·d)
+    // Express as a 0..1 demand against available longitudinal brake grip,
+    // and keep the SINGLE WORST demand across the scan. The 3-zone pedal
+    // mapping (below) then turns that into a smooth brake/coast/throttle
+    // gradient, so a corner at d=400 starts a light coast-dab and naturally
+    // builds to full pedal as we close in — no on/off binary that brakes
+    // the whole straight.
+    //
+    // Anomaly filter (critical): the Hierholzer Euler-circuit extractor
+    // leaves waypoints with absurdly low v (down to 2-3 m/s) at junctions /
+    // doubled-back sections. They sit ON tarmac so loadRacingLine's
+    // on-track filter keeps them. If we don't ignore them here, every
+    // straight has a "phantom hairpin" 50-100 m ahead and the AI brakes
+    // continuously. We use a windowed-mean of the 6 neighbors on each
+    // side and drop any waypoint whose v < 55% of that mean. This was the
+    // single biggest cause of the "AI just brakes constantly" symptom.
+    //
+    // aAvail is shaped by the friction-circle: lateral grip currently in
+    // use eats into longitudinal grip. Mid-corner we have LESS brake
+    // authority — that's correct physics and stops the AI from spinning
+    // under brake mid-corner (which the old controller did because it
+    // assumed full grip on the brake axis always).
+    const ord = fwdIdx.map( ( _, k ) => k ).sort( ( a, b ) => fwdDist[ a ] - fwdDist[ b ] );
+    const SCAN_N = Math.min( 50, ord.length );
+
+    // Effective speed cap for the picked target waypoint (per-car / per-track).
+    // 0.95 headroom keeps us off the very edge so a bump or kerb doesn't push
+    // us past the friction limit at apex.
+    const apexHeadroom = 0.95;
+    const targetVraw = target.v * speedScale;
+    const targetV = targetVraw * apexHeadroom;
+
+    // Friction-circle adjustment of brake authority. We don't have yaw rate
+    // cheaply, so use |v_lat| / (speed × 0.35) as a 0..1 proxy for "how
+    // much lateral grip is being spent right now." 0.35 is empirical: it
+    // saturates to 1 when |v_lat| ≈ 0.35 × speed, which corresponds to a
+    // big-slip (>20°) cornering state. Below speed=4 m/s we don't apply
+    // the friction-circle scaling (low-speed dynamics aren't grip-limited).
+    const _vLateralNow = Math.abs( v.x * _aiRight.x + v.z * _aiRight.z );
+    const _latUseRatio = THREE.MathUtils.clamp(
+        ( speed > 4 ? _vLateralNow / Math.max( 4, speed * 0.35 ) : 0 ),
+        0, 0.95
+    );
+    // Brake-axis grip available right now: nominal longitudinal grip × brake
+    // bias, scaled by friction-circle ellipse (sqrt(1 - latUse²)). Floor 0.20
+    // so even a full-slip drift still leaves us SOME brake authority (the
+    // AI shouldn't refuse to brake just because the rear stepped out).
+    const aAvailLong = 9.81 * carP.brakeBias * trackP.gripMu *
+        Math.sqrt( Math.max( 0.20, 1.0 - _latUseRatio * _latUseRatio ) );
+
+    // Track the worst SINGLE upcoming corner (highest demand) AND the
+    // weakest absolute cap anywhere ahead (so the throttle branch can
+    // recognise "tight corner coming, don't floor it").
+    let brakeDemand = 0;     // 0…1 normalised required-decel / brake grip
+    let anyVtAhead = Infinity;
+    for ( let s = 0; s < SCAN_N; s ++ ) {
+
+        const wi = fwdIdx[ ord[ s ] ];
+        const d = fwdDist[ ord[ s ] ];
+        const w = racingLine[ wi ];
+
+        // Anomaly filter: compute neighbor-mean v over a ±6 waypoint window.
+        // If w.v is < 55% of that mean (AND the mean is high enough that we
+        // wouldn't be filtering out a real hairpin), it's almost certainly a
+        // Hierholzer doubled-back artifact, not a real corner — skip it.
+        // Cheap and bounded: 12 reads per scanned waypoint. This was the
+        // single biggest cause of "the AI just brakes for no reason and
+        // stops on every straight" — the optimizer JSONs have v as low as
+        // 2-3 m/s at junction artifacts that the on-track filter can't see.
+        let medSum = 0, medCount = 0;
+        for ( let k = - 6; k <= 6; k ++ ) {
+
+            if ( k === 0 ) continue;
+            const ni = ( ( wi + k ) % n + n ) % n;
+            medSum += racingLine[ ni ].v;
+            medCount ++;
+
+        }
+        const medV = medCount > 0 ? medSum / medCount : w.v;
+        if ( w.v < medV * 0.55 && medV > 6 ) continue;
+
+        // Effective cap, with optional small lift for late-brakers. Hard-capped
+        // at vCap × 1.04 so even cornerEntryLift = 0.92 can't push us more
+        // than ~4% over the optimizer's grip-limited speed. This protects
+        // against the launch-off-track bug the first iteration of this AI
+        // had — gripMu × cornerEntryLift stacking to 1.75× the JSON cap.
+        const vCap = w.v * speedScale * apexHeadroom;
+        const liftDiv = Math.max( 0.96, carP.cornerEntryLift );
+        const vEff = Math.min( vCap / liftDiv, vCap * 1.04 );
+        if ( vEff < anyVtAhead ) anyVtAhead = vEff;
+        if ( vEff >= speed ) continue;     // we'd already be slow enough — skip
+
+        const dEff = Math.max( 2, d );
+        const aReq = ( speed * speed - vEff * vEff ) / ( 2 * dEff );
+        const demand = aReq / aAvailLong;
+
+        if ( demand > brakeDemand ) brakeDemand = demand;
+
+    }
+    // anyVtAhead may still be Infinity if every visible waypoint is above
+    // current speed; collapse to a sensible value for the throttle branch.
+    if ( ! isFinite( anyVtAhead ) ) anyVtAhead = targetVraw;
 
     // Express target in car-local frame:
     //   lz = signed forward distance, POSITIVE when target is in front
     //   lx = signed lateral offset, POSITIVE when target is to the LEFT
     // (left-positive matches the codebase's input.steer convention where
     //  +1 = left — see updateInput where A/← contribute +1 to kSteer.)
-    // _aiFwd / _aiRight were already populated above for the dual lookahead.
     const dx = target.x - t.x, dz = target.z - t.z;
     const lz = dx * _aiFwd.x + dz * _aiFwd.z;
     const lx = - ( dx * _aiRight.x + dz * _aiRight.z );
@@ -9640,50 +10565,172 @@ function aiUpdate( dt ) {
     const wheelbase = 2.6;
     const delta = Math.atan2( 2 * wheelbase * Math.sin( alpha ), Math.max( 6, lookAhead ) );
     let steer = THREE.MathUtils.clamp( delta / ( 35 * Math.PI / 180 ), - 1, 1 );
+    const absSteer = Math.abs( steer );
 
-    // Speed target: just use the picked target's `v` directly. (Smoothing
-    // over neighbouring indices doesn't help when the JSON array order
-    // doesn't follow the physical loop — neighbours might be a long way
-    // around the loop physically.)
-    const targetV = target.v;
-    const dv = targetV - speed;
+    // Slip-aware throttle dampening: the perpendicular component of velocity
+    // (lateral slip in m/s, NOT slip-angle, but it's a clean proxy without
+    // having to dig into Rapier wheel state every frame) is how we tell that
+    // the rear is stepping out. Above carP.slipLimit we cap throttle.
+    const vLateral = Math.abs( v.x * _aiRight.x + v.z * _aiRight.z );
+    let slipScale = 1.0;
+    if ( vLateral > carP.slipLimit && speed > 6 ) {
 
+        // Linear taper from 1.0 down to 0.5 as slip overshoots by ~3 m/s.
+        slipScale = THREE.MathUtils.clamp(
+            1.0 - ( vLateral - carP.slipLimit ) / 6.0,
+            0.5, 1.0
+        );
+
+    }
+
+    // ─── throttle / brake decision ───────────────────────────────────
+    // Three zones, keyed to brakeDemand (= required-decel / available-decel):
+    //   demand ≥ 0.70 : HARD BRAKE. Pedal = demand × 1.10 clamped to [0.35, 1.0].
+    //                   Throttle off. We're committed.
+    //   0.40 ≤ d < 0.70: SOFT BRAKE. Pedal = (d − 0.40) + 0.15, throttle off.
+    //                   "Coast and dab" — we'd be reckless to keep throttling
+    //                   but we don't need to stomp yet. Bleeds speed gently
+    //                   into the brake zone proper.
+    //   demand < 0.40 : DRIVE. Throttle ramped on (1 − absSteer), corner-aware.
+    //
+    // The proportional pedal-mapping replaces the previous binary "100% brake
+    // above 1.0, scaled brake between 0.55..1, full throttle otherwise" — that
+    // had an EMERGENCY-BRAKE multiplicative seatbelt on top, which is what
+    // made the AI brake the whole straight ("speed > worstVt × 1.5" stays
+    // true for most of the deceleration and pegged demand=1 forever).
     let throttle = 0, brake = 0;
-    if ( dv > 0.5 ) {
+    if ( brakeDemand >= 0.70 ) {
 
-        // Below target: accelerate. Generous P-gain so we close the gap on
-        // straights but don't spin tyres at standstill (steeper ramp once
-        // we're rolling).
-        throttle = THREE.MathUtils.clamp( 0.3 + dv * 0.12, 0.2, 1.0 );
+        // HARD brake: pedal tracks demand with a small +10% bias so we always
+        // brake a hair harder than the bare minimum (eats actuation lag, ABS
+        // overshoot, kerb bumps). Floor 0.35 so the very edge of the hard
+        // zone still feels like a real brake application.
+        brake = THREE.MathUtils.clamp( brakeDemand * 1.10, 0.35, 1.0 );
+        throttle = 0;
 
-    } else if ( dv < - 1.5 ) {
+    } else if ( brakeDemand >= 0.40 ) {
 
-        // Significantly over target: brake. Asymmetric — brakes ramp gently
-        // (avoids ABS flicker) but reach 1.0 by ~15 m/s overspeed.
-        brake = THREE.MathUtils.clamp( ( - dv - 1.5 ) * 0.08, 0.1, 1.0 );
+        // SOFT brake / coast zone. 15-45% pedal. Throttle off. This is the
+        // "coast into the corner" the previous controller missed — without
+        // it, the AI was either flooring it or stomping the brake, never in
+        // between, and it was always too late to soft-brake.
+        brake = THREE.MathUtils.clamp( ( brakeDemand - 0.40 ) * 1.0 + 0.15, 0.15, 0.50 );
+        throttle = 0;
 
     } else {
 
-        // Within ±1 m/s of target: coast at light throttle.
-        throttle = 0.15;
+        // DRIVE: open the taps. exitOpen ramps with (1 − absSteer); throttleRamp
+        // shapes how aggressive the curve is (god / F1 / rally stamp earlier,
+        // muscle / hatch progressive). Baseline 0.25 keeps the car off coast.
+        const exitOpen = Math.max( 0, 1.0 - absSteer * 1.15 );
+        const ramp = Math.pow( exitOpen, 1.6 - carP.throttleRamp );
+        const base = 0.25;
+        throttle = THREE.MathUtils.clamp( base + ( 1.0 - base ) * ramp * carP.throttleRamp, 0, 1 );
+
+        // Floor it when straight AND well under both the picked target cap
+        // AND the weakest visible cap — i.e. we're truly on a straight, not
+        // closing in on a hidden hairpin. The anyVtAhead guard is what makes
+        // this safe (the old controller checked only against `targetV` which
+        // is the LOOKAHEAD point, not the slowest corner ahead).
+        if ( absSteer < 0.15 && speed < targetV - 4 && speed < anyVtAhead - 2 ) {
+
+            throttle = 1.0;
+
+        }
+
+        // Soft brake if we're nudging over the picked apex cap (small overshoot
+        // catch — different from brakeDemand which is about reaching the future
+        // cap, this is "you're already over the local cap right now").
+        if ( speed > targetV + 1.5 ) {
+
+            brake = THREE.MathUtils.clamp( ( speed - targetV - 1.5 ) * 0.07, 0.05, 0.4 );
+            throttle *= 0.4;
+
+        }
 
     }
 
-    // Trail-brake on steering: a little brake while turning helps the car
-    // rotate; cancels at very high steering angles where the front tyres
-    // would just plough.
-    const absSteer = Math.abs( steer );
-    if ( throttle < 0.1 && absSteer > 0.25 && absSteer < 0.85 ) {
+    // ─── Trail-braking ───────────────────────────────────────────────
+    // Apply a tapered brake during turn-in: peak at high steering + medium
+    // speed, decay to zero as we straighten or slow. Per-car trailBrakeStrength
+    // means hot hatch barely trails (~0.05) while F1 / supercar trail more
+    // aggressively (~0.20). Only applies when we're not already throttle-on
+    // out of the apex AND when we're NOT already braking hard from the
+    // primary branch (don't stack ~30% brake on top of 100% — that's just
+    // 100%, fine — but stacking trail-brake on top of a 60% primary brake
+    // pushes us over the friction-circle limit mid-corner and spins us).
+    if ( speed > 12 && absSteer > 0.18 && absSteer < 0.85 &&
+         throttle < 0.6 && brake < 0.35 ) {
 
-        brake = Math.max( brake, 0.15 * absSteer );
+        const turnIn = Math.min( 1, ( absSteer - 0.18 ) / 0.45 );
+        const speedFade = Math.min( 1, ( speed - 12 ) / 25 );
+        const trail = carP.trailBrakeStrength * turnIn * speedFade;
+        brake = Math.max( brake, trail );
 
     }
+
+    // Apply the slip-aware throttle cap last so trail-brake and corner-exit
+    // ramp both fold into it.
+    throttle *= slipScale;
 
     // Reverse safety: dot of velocity onto forward — positive when going
     // forward, negative when going backward. Full brake if we've actually
-    // started rolling backward.
+    // started rolling backward. (Stuck-recovery block below owns the full
+    // recovery; this just stops us digging in deeper while we wait for it.)
+    //
+    // Suppressed during the post-recovery grace window: just exited a
+    // 1.2 s deliberate reverse, so backward velocity is EXPECTED for the
+    // next second or so. If we slammed full brake here we'd never coast
+    // back to neutral and the engage-throttle below would never get to
+    // push us forward.
     const vFwd = v.x * _aiFwd.x + v.z * _aiFwd.z;
-    if ( vFwd < - 2 ) { throttle = 0; brake = 1.0; }
+    const _inGrace = ai.postRecoverUntil && now < ai.postRecoverUntil;
+    if ( vFwd < - 2 && ! _inGrace ) { throttle = 0; brake = 1.0; }
+
+    // ─── stuck detection ────────────────────────────────────────────
+    // If forward velocity stays near zero while we want to ACCELERATE, the
+    // car is wedged — usually nose-first into a wall or grass perpendicular
+    // to the racing line. After ~1.5 s of crawl, arm a fixed 2.5 s reverse
+    // to back out; the per-frame direction picker then re-acquires the line
+    // facing whichever way the car ends up.
+    //
+    // Two guards on top of "only count throttle, not brake":
+    //   - postRecoverUntil: skip the entire counter for 1.5 s after a
+    //     recovery so the car has time to pick up forward speed before we
+    //     decide it's stuck again. Otherwise the loop reverse → stop → check
+    //     → still slow → reverse fires endlessly.
+    //   - require speed < 1.0 m/s AND throttle > 0.2, not just "applied".
+    //     Anything moving above 1 m/s isn't actually wedged.
+    const inPostRecoverGrace = ai.postRecoverUntil && now < ai.postRecoverUntil;
+    if ( ! inPostRecoverGrace && Math.abs( vFwd ) < 1.0 && throttle > 0.2 && brake < 0.2 ) {
+
+        ai.stuckMs += dt * 1000;
+
+    } else {
+
+        ai.stuckMs = 0;
+
+    }
+    if ( ai.stuckMs > 1500 ) {
+
+        // 1.2 s of reverse at 0.55 brake builds ~6 m/s of backward speed,
+        // enough to clear most wedge-against-wall cases without taking a
+        // long time to bleed back off. Was 2.5 s × 0.7 brake — that built
+        // ~12 m/s of backward speed and the bleed-off ate the entire
+        // post-recovery grace window, looping reverse-and-stuck forever.
+        ai.recoverUntil = now + 1200;
+        ai.stuckMs = 0;
+        console.log( '[ai] stuck → reversing 1.2s' );
+        input.steerRaw = 0;
+        input.steer = 0;
+        input.throttle = 0;
+        input.brake = 0.55;
+        input.handbrake = 0;
+        input.handbrakeAfterReset = false;
+        input.reverseEngaged = true;
+        return;
+
+    }
 
     input.steerRaw = steer;
     input.steer = steer;
@@ -9778,10 +10825,11 @@ function buildAiLineMesh() {
     arrow.setIndex( [ 0, 1, 2 ] );
     arrow.computeVertexNormals();
 
+    // Per-instance color: white base, real color comes from instanceColor.
     const mat = new THREE.MeshBasicMaterial( {
-        color: ai.paintColor,
+        color: 0xFFFFFF,
         transparent: true,
-        opacity: 0.85,
+        opacity: 0.9,
         side: THREE.DoubleSide,
         depthWrite: false
     } );
@@ -9789,6 +10837,65 @@ function buildAiLineMesh() {
     const inst = new THREE.InstancedMesh( arrow, mat, count );
     inst.frustumCulled = false;   // bbox of the whole loop is the track itself
     inst.renderOrder = 999;
+    // Allocate per-instance color buffer so chevrons can show braking state.
+    inst.instanceColor = new THREE.InstancedBufferAttribute( new Float32Array( count * 3 ), 3 );
+
+    // Speed-delta color ramp (F1 22 / Forza / ACC convention):
+    //   red    = braking zone   (speed dropping ahead on the line)
+    //   yellow = coast / steady (speed roughly constant)
+    //   green  = throttle-on    (speed rising ahead on the line)
+    // `racingLine[*].v` is in m/s (same unit the AI controller compares
+    // against `speed` in m/s below). Calibrated against the four bundled
+    // racing-line JSONs — the 5th/95th percentile of dv/ds across
+    // Nürburgring, Spa, Suzuka, and Nürburgring GP all sit in ±0.3 to ±0.7
+    // (m/s)/m, so ±0.4 puts true braking/throttle events at the saturated
+    // ends of the ramp while light coast stays yellow.
+    const BRAKE_SLOPE = - 0.4;   // (m/s) per m → bright red at or below
+    const ACCEL_SLOPE =   0.4;   // (m/s) per m → bright green at or above
+    const _colRed    = new THREE.Color( 0xFF2030 );
+    const _colYellow = new THREE.Color( 0xFFD000 );
+    const _colGreen  = new THREE.Color( 0x22DD44 );
+    const _colTmp    = new THREE.Color();
+    function _chevronColor( dvds, out ) {
+
+        if ( dvds <= BRAKE_SLOPE ) { out.copy( _colRed ); return; }
+        if ( dvds >= ACCEL_SLOPE ) { out.copy( _colGreen ); return; }
+        if ( dvds < 0 ) {
+
+            // Brake → yellow band: t=0 at BRAKE_SLOPE (red), t=1 at 0 (yellow).
+            const t = 1 - ( dvds / BRAKE_SLOPE );
+            out.copy( _colRed ).lerp( _colYellow, t );
+
+        } else {
+
+            // Yellow → green band: t=0 at 0 (yellow), t=1 at ACCEL_SLOPE (green).
+            const t = dvds / ACCEL_SLOPE;
+            out.copy( _colYellow ).lerp( _colGreen, t );
+
+        }
+
+    }
+
+    // Pre-compute dv/ds per accepted chevron using a ~k-step lookahead along
+    // the accepted strip itself (matches what the driver actually sees ahead).
+    const LOOKAHEAD = 3;
+    const _dvds = new Float32Array( count );
+    for ( let ai_i = 0; ai_i < count; ai_i ++ ) {
+
+        const w0 = racingLine[ accepted[ ai_i ] ];
+        let s = 0;
+        let last2 = w0;
+        for ( let k = 1; k <= LOOKAHEAD; k ++ ) {
+
+            const wk = racingLine[ accepted[ ( ai_i + k ) % count ] ];
+            s += Math.hypot( wk.x - last2.x, wk.z - last2.z );
+            last2 = wk;
+
+        }
+        const wN = racingLine[ accepted[ ( ai_i + LOOKAHEAD ) % count ] ];
+        _dvds[ ai_i ] = s > 0.01 ? ( wN.v - w0.v ) / s : 0;
+
+    }
 
     const ray = new THREE.Raycaster();
     const down = new THREE.Vector3( 0, - 1, 0 );
@@ -9829,8 +10936,12 @@ function buildAiLineMesh() {
         tmpM.compose( tmpP, tmpQ, tmpS );
         inst.setMatrixAt( ai_i, tmpM );
 
+        _chevronColor( _dvds[ ai_i ], _colTmp );
+        inst.setColorAt( ai_i, _colTmp );
+
     }
     inst.instanceMatrix.needsUpdate = true;
+    if ( inst.instanceColor ) inst.instanceColor.needsUpdate = true;
     scene.add( inst );
     ai.lineMesh = inst;
 
