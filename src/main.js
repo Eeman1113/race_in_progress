@@ -8433,11 +8433,14 @@ function _buildHatchback( parent ) {
 
     // Bonnet (short)
     _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.06, 1.0 ), bodyMat, [ 0, 0.16, - 1.25 ] );
-    // Rear hatch (vertical) — pushed 5 mm aft so its front face (1.78)
-    // doesn't graze the body's back face (1.80) and Z-fight the yellow.
+    // Rear hatch (vertical) — sits 5 mm aft of body back-face (1.80).
+    // Spans z=[1.805, 1.865]. Yellow bodyMat.
     _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.55, 0.06 ), bodyMat, [ 0, 0.15, 1.835 ] );
-    // Rear hatch glass — pushed 5 mm aft to clear the body's back face.
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.42, 0.04 ), cabinMat, [ 0, 0.32, 1.845 ] );
+    // Rear hatch glass — pushed slightly proud of the hatch panel's back
+    // face so the panel back (1.865) and glass back (would be 1.865 too
+    // if z=1.845) don't share a depth plane → flicker. New z=1.855 gives
+    // glass back at 1.875, 10 mm clear of panel back.
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.42, 0.04 ), cabinMat, [ 0, 0.32, 1.855 ] );
 
     // Front bumper (chunky plastic black)
     _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.28, 0.22 ), bumperMat, [ 0, - 0.32, - 1.82 ] );
