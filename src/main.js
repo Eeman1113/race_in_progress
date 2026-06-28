@@ -9044,14 +9044,19 @@ function _buildGodCar( parent ) {
     seamR.position.set( 0.96, 0.05, 0 );
     parent.add( seamR );
 
-    // Actual PointLight under the chassis to spill colour onto the road.
-    // Tagged so the per-frame updater knows which light to drive. Distance
-    // 4m keeps the falloff local (no lighting up trees a block away),
-    // intensity moderate so it reads as glow without blowing out the tarmac.
-    const roadLight = new THREE.PointLight( 0x00FFFF, 2.5, 4.0, 1.5 );
-    roadLight.position.set( 0, - 0.55, 0 );
-    roadLight.userData.godRoadLight = true;
-    parent.add( roadLight );
+    // Five PointLights distributed along the chassis (z = -1.4 → +1.4) to
+    // spread the glow evenly under the whole car instead of one bright
+    // hotspot at the centre. Each is half-intensity, lower range, higher
+    // decay so individual contributions soft-blend across the underside.
+    // All tagged godRoadLight so updateGodNeon drives every one.
+    for ( const z of [ - 1.4, - 0.7, 0, 0.7, 1.4 ] ) {
+
+        const rl = new THREE.PointLight( 0x00FFFF, 0.9, 3.5, 1.8 );
+        rl.position.set( 0, - 0.55, z );
+        rl.userData.godRoadLight = true;
+        parent.add( rl );
+
+    }
 
     // Full-width front LED light bar (white)
     _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.04, 0.06 ), headlightMat, [ 0, - 0.08, - 1.88 ] );
