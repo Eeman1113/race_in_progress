@@ -8433,14 +8433,19 @@ function _buildHatchback( parent ) {
 
     // Bonnet (short)
     _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.06, 1.0 ), bodyMat, [ 0, 0.16, - 1.25 ] );
-    // Rear hatch (vertical) — sits 5 mm aft of body back-face (1.80).
-    // Spans z=[1.805, 1.865]. Yellow bodyMat.
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.55, 0.06 ), bodyMat, [ 0, 0.15, 1.835 ] );
-    // Rear hatch glass — pushed slightly proud of the hatch panel's back
-    // face so the panel back (1.865) and glass back (would be 1.865 too
-    // if z=1.845) don't share a depth plane → flicker. New z=1.855 gives
-    // glass back at 1.875, 10 mm clear of panel back.
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.5, 0.42, 0.04 ), cabinMat, [ 0, 0.32, 1.855 ] );
+    // Rear hatch FRAME — split into 4 yellow rails (top / bottom / left /
+    // right pillars) so the glass can be RECESSED into the cutout instead
+    // of bulging out behind the panel. Frame back face at z=1.865 (5 mm
+    // aft of body back-face 1.80). Total outer envelope matches the prior
+    // solid panel: width 1.7, height 0.55, Y range [-0.125 .. 0.425].
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.10, 0.06 ), bodyMat, [ 0,    0.375, 1.835 ] );  // top rail
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.10, 0.06 ), bodyMat, [ 0,  - 0.075, 1.835 ] );  // bottom rail
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.12, 0.35, 0.06 ), bodyMat, [ - 0.79, 0.150, 1.835 ] );  // left pillar
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.12, 0.35, 0.06 ), bodyMat, [ 0.79,   0.150, 1.835 ] );  // right pillar
+    // Rear hatch glass — recessed INSIDE the frame cutout (Y[-0.025..0.325],
+    // X[-0.73..0.73]). Back face z=1.85, 15 mm forward of frame back face
+    // 1.865. Reads as a proper window set INTO the hatch, not bulging.
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.40, 0.32, 0.03 ), cabinMat, [ 0, 0.15, 1.835 ] );
 
     // Front bumper (chunky plastic black)
     _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.28, 0.22 ), bumperMat, [ 0, - 0.32, - 1.82 ] );
